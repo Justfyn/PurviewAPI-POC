@@ -1,0 +1,8 @@
+# Microsoft Graph SDK for Python
+msgraph-sdk>=1.0.0
+
+# Azure Identity for authentication
+azure-identity>=1.15.0
+
+# Required for async operations
+aiohttp>=3.9.0
