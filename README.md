@@ -14,7 +14,9 @@ A Proof of Concept demonstrating how to integrate custom applications with **Mic
 
 ### 1. Licensing
 
-One of the following licensing options is required:
+#### For the `processContent` API (Required)
+
+The API uses DLP policies with Entra enforcement. Any of these licenses work:
 
 | License Option | Notes |
 |----------------|-------|
@@ -23,8 +25,21 @@ One of the following licensing options is required:
 | **Microsoft 365 E3 + E5 Compliance add-on** | Alternative add-on option |
 | **Microsoft 365 E3 + E5 Information Protection & Governance add-on** | Covers DLP features |
 | **Office 365 E5** | Includes DLP capabilities |
+| **Microsoft 365 E3** | Basic DLP for Exchange, SharePoint, OneDrive only |
 
-> **Note:** Basic DLP for Exchange, SharePoint, and OneDrive is available with E3. The `processContent` API uses DLP policies with Entra enforcement, which falls under standard DLP licensing.
+#### For DSPM for AI Portal Features (Recommended)
+
+To view prompts/responses and get full visibility in the Purview portal:
+
+| Feature | E3 | E5 / Purview Suite |
+|---------|-----|-----|
+| View app info | ✅ | ✅ |
+| Export activity | ✅ | ✅ |
+| Turn on auditing | ✅ | ✅ |
+| **View prompt & response** | ❌ | ✅ |
+| **Full DSPM for AI insights** | ❌ | ✅ |
+
+> **Summary:** The API itself works with E3 + DLP capabilities. For full monitoring and visibility of AI interactions in the Purview portal, E5 or Microsoft Purview Suite add-on is recommended.
 
 ### 2. Entra ID App Registration
 
@@ -61,18 +76,20 @@ From the **Overview** page, copy:
 
 ### 3. Microsoft Purview Configuration
 
-#### A. Enable Audit (if not already enabled)
+#### A. Enable Audit (Required)
 
 1. Go to [Microsoft Purview Portal](https://purview.microsoft.com)
 2. Navigate to **DSPM for AI** → **Overview**
 3. Click **Activate Microsoft Purview Audit**
 
-#### B. Enable DSPM for AI Policies
+#### B. Enable DSPM for AI Policies (Recommended - E5 only)
+
+> **Note:** This step provides visibility into AI interactions in the Purview portal. The API works without this, but you won't see prompts/responses in the portal.
 
 1. Go to **DSPM for AI** → **Recommendations**
 2. Enable: **Secure interactions from enterprise apps (preview)**
 
-#### C. Create DLP Policy with Entra Enforcement
+#### C. Create DLP Policy with Entra Enforcement (Required)
 
 Connect to Security & Compliance PowerShell:
 
