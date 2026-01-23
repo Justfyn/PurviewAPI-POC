@@ -12,36 +12,7 @@ A Proof of Concept demonstrating how to integrate custom applications with **Mic
 
 ## Prerequisites
 
-### 1. Licensing
-
-#### For the `processContent` API (Required)
-
-The API uses DLP policies with Entra enforcement. Any of these licenses work:
-
-| License Option | Notes |
-|----------------|-------|
-| **Microsoft 365 E5** | Full Purview capabilities |
-| **Microsoft 365 E3 + Microsoft Purview Suite add-on** | Recommended for E3 customers |
-| **Microsoft 365 E3 + E5 Compliance add-on** | Alternative add-on option |
-| **Microsoft 365 E3 + E5 Information Protection & Governance add-on** | Covers DLP features |
-| **Office 365 E5** | Includes DLP capabilities |
-| **Microsoft 365 E3** | Basic DLP for Exchange, SharePoint, OneDrive only |
-
-#### For DSPM for AI Portal Features (Recommended)
-
-To view prompts/responses and get full visibility in the Purview portal:
-
-| Feature | E3 | E5 / Purview Suite |
-|---------|-----|-----|
-| View app info | ✅ | ✅ |
-| Export activity | ✅ | ✅ |
-| Turn on auditing | ✅ | ✅ |
-| **View prompt & response** | ❌ | ✅ |
-| **Full DSPM for AI insights** | ❌ | ✅ |
-
-> **Summary:** The API itself works with E3 + DLP capabilities. For full monitoring and visibility of AI interactions in the Purview portal, E5 or Microsoft Purview Suite add-on is recommended.
-
-### 2. Entra ID App Registration
+### 1. Entra ID App Registration
 
 Create an app registration in [Entra ID](https://entra.microsoft.com):
 
@@ -74,7 +45,7 @@ From the **Overview** page, copy:
 - **Application (client) ID**
 - **Directory (tenant) ID**
 
-### 3. Microsoft Purview Configuration
+### 2. Microsoft Purview Configuration
 
 #### A. Enable Audit (Required)
 
