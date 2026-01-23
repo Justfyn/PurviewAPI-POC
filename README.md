@@ -14,7 +14,17 @@ A Proof of Concept demonstrating how to integrate custom applications with **Mic
 
 ### 1. Licensing
 
-- **Microsoft 365 E5** license (required for Purview DLP and DSPM for AI)
+One of the following licensing options is required:
+
+| License Option | Notes |
+|----------------|-------|
+| **Microsoft 365 E5** | Full Purview capabilities |
+| **Microsoft 365 E3 + Microsoft Purview Suite add-on** | Recommended for E3 customers |
+| **Microsoft 365 E3 + E5 Compliance add-on** | Alternative add-on option |
+| **Microsoft 365 E3 + E5 Information Protection & Governance add-on** | Covers DLP features |
+| **Office 365 E5** | Includes DLP capabilities |
+
+> **Note:** Basic DLP for Exchange, SharePoint, and OneDrive is available with E3. The `processContent` API uses DLP policies with Entra enforcement, which falls under standard DLP licensing.
 
 ### 2. Entra ID App Registration
 
