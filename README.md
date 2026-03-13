@@ -1,32 +1,43 @@
 # Microsoft Purview API — Live Demo
 
-A stunning, presenter-ready demo showing how **any custom application or AI app** can integrate with **Microsoft Purview** for real-time DLP enforcement and audit using the official API flow.
+A proof-of-concept showing how **any custom application or AI app** can integrate with **Microsoft Purview** for real-time DLP enforcement and audit using the official API flow.
 
 ```
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                ARCHITECTURE OVERVIEW                            │
-  │                                                                │
-  │   User            Orchestrator App       Purview        AI     │
-  │   ────            ────────────────       ───────        ──     │
-  │                                                                │
-  │   Step 1 ──► protectionScopes/compute ──► Policies DB          │
-  │              (which policies apply?)       Returns ETag        │
-  │                                                                │
-  │   Step 2a ──► processContent ──────────► DLP Engine            │
-  │              activity: uploadText          BLOCK / ALLOW       │
-  │              (check user prompt)                               │
-  │                                                                │
-  │   If ALLOWED ──────────────────────────────────────► AI Model  │
-  │                                                                │
-  │   Step 2b ──► processContent ──────────► Audit                 │
-  │              activity: downloadText       Activity Explorer    │
-  │              (audit AI response)          DSPM for AI          │
-  └─────────────────────────────────────────────────────────────────┘
+    User                 Your App                  Purview API              AI Model
+     │                     │                          │                       │
+     │                     │  Step 1                  │                       │
+     │                     │  protectionScopes/compute│                       │
+     │                     │ ────────────────────────>│                       │
+     │                     │         ETag + scopes    │                       │
+     │                     │ <────────────────────────│                       │
+     │                     │                          │                       │
+     │  prompt             │  Step 2a                 │                       │
+     │ ───────────────────>│  processContent          │                       │
+     │                     │  activity: uploadText    │                       │
+     │                     │ ────────────────────────>│                       │
+     │                     │                          │                       │
+     │                     │    BLOCK or ALLOW        │                       │
+     │                     │ <────────────────────────│                       │
+     │                     │                          │                       │
+     │                     │── if BLOCKED ──> return error to user            │
+     │                     │                          │                       │
+     │                     │── if ALLOWED ───────────────────────────────────>│
+     │                     │                          │          AI response  │
+     │                     │<────────────────────────────────────────────────-│
+     │                     │                          │                       │
+     │                     │  Step 2b                 │                       │
+     │                     │  processContent          │                       │
+     │                     │  activity: downloadText  │                       │
+     │                     │ ────────────────────────>│                       │
+     │                     │        (async audit)     │                       │
+     │  response           │                          │                       │
+     │ <───────────────────│                          │                       │
+     │                     │                          │                       │
 ```
 
 ## Key Concepts
 
-| Term | Plain-English meaning | Where it appears |
+| Term | Description | Where it appears |
 |------|-----------------------|------------------|
 | **Integrated app** | The app that calls the Purview APIs. Think of it as the **orchestrator** or **messenger**. | `integratedAppMetadata` in `processContent`; optional `integratedAppMetadata` in `protectionScopes/compute` |
 | **Protected app** | The app whose prompts/responses are being governed by Purview policy. Think of it as the **thing being protected**. | `protectedAppMetadata.applicationLocation` in `processContent` |
@@ -34,7 +45,7 @@ A stunning, presenter-ready demo showing how **any custom application or AI app*
 | **Collection Policy (KYD)** | Captures prompts/responses for audit, DSPM for AI, eDiscovery, Insider Risk, and Communication Compliance. | Purview portal / DSPM for AI |
 | **DLP Policy** | Decides whether content should be blocked or allowed. | `processContent` result |
 
-## ELI5 Mental Model
+## Mental Model
 
 If you only remember one thing, remember this:
 
@@ -93,7 +104,7 @@ If your orchestrator protects content **for another app**, use:
 
 ## Demo Scenarios
 
-The scripted demo runs 4 scenarios in storytelling order:
+The scripted demo runs 4 scenarios:
 
 | # | Scenario | Expected | Why |
 |---|----------|----------|-----|
@@ -102,7 +113,7 @@ The scripted demo runs 4 scenarios in storytelling order:
 | 3 | Credit Card Number | 🛑 BLOCK | Payment card data with payment context |
 | 4 | Data Exfiltration Attempt | 🛑 BLOCK | Multiple sensitive data types in one suspicious prompt |
 
-> **Scenario 1→2** is the strongest story point: same number, different context, different decision. Purview uses **contextual intelligence**, not just regex.
+> **Scenario 1→2** highlights contextual intelligence: same number, different context, different decision. Purview goes beyond simple pattern matching.
 
 ---
 
@@ -249,7 +260,7 @@ python classify_text.py
 
 ### Demo Flow
 
-1. **Banner** — dramatic ASCII art intro
+1. **Banner** — intro screen
 2. **Authentication** — browser sign-in, shows user identity
 3. **Step 1** — `protectionScopes/compute` — discovers policies, caches ETag
 4. **Step 2a** — `processContent(uploadText)` — 4 scripted scenarios with DLP decisions
@@ -631,7 +642,7 @@ The protected app is the app/location whose prompts or responses are being evalu
 
 Yes. In a simple demo they are often the same. In a real orchestrator pattern they can be different.
 
-The strongest evidence is the API shape itself: `processContent` has separate fields for `integratedAppMetadata` and `protectedAppMetadata`, which strongly suggests Microsoft expects these to be distinct concepts even if many demos use the same app for both.
+The API shape itself reflects this: `processContent` has separate fields for `integratedAppMetadata` and `protectedAppMetadata`, indicating these are distinct concepts even if many demos use the same app for both.
 
 ### Why can `protectionScopes/compute` feel different from `processContent`?
 
