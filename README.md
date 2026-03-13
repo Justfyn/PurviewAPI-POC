@@ -214,13 +214,15 @@ New-DlpComplianceRule -Name "Block Credit Cards in AI Apps" `
 
 ### 3. Licensing
 
+This POC uses the **Data Security — In Transit Protection** capability in Microsoft Purview (DLP enforcement via the `processContent` API). See the [Purview pricing page](https://azure.microsoft.com/en-us/pricing/details/purview/) for current meter details.
+
 | License | API Works? | DSPM Portal? |
 |---------|------------|--------------|
 | **E5** | ✅ | ✅ |
 | **E3 + DLP add-on** | ✅ | ❌ |
 | **E3 alone** | ❌ | ❌ |
 
-The API itself works with E3 + a DLP add-on. The full DSPM for AI portal experience requires E5.
+The `processContent` and `protectionScopes/compute` APIs fall under **In Transit Protection** and require at least E3 with a DLP add-on. The full DSPM for AI portal experience requires E5.
 
 ---
 
