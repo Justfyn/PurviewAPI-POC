@@ -14,10 +14,14 @@ Usage:
 """
 
 import asyncio
+import base64
 import uuid
 import time
 import sys
 import io
+import re
+import zipfile
+from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime, timezone
 
 import aiohttp
@@ -37,6 +41,8 @@ from config import (
     INTEGRATED_APP_NAME, INTEGRATED_APP_VERSION,
     PROTECTED_APP_NAME, PROTECTED_APP_VERSION, PROTECTED_APP_CLIENT_ID,
     POLICY_LOCATION_APP_ID,
+    PROTECTION_SCOPE_ACTIVITIES, FILE_PROBE_ACTIVITIES,
+    FILE_PROBE_TEXT, FILE_PROBE_FILE_NAME,
 )
 
 # Force UTF-8 output on Windows to support emojis and box-drawing characters
@@ -196,7 +202,7 @@ async def authenticate() -> dict | None:
 # ═══════════════════════════════════════════════════════════════════════
 # STEP 1 — COMPUTE PROTECTION SCOPES
 # ═══════════════════════════════════════════════════════════════════════
-async def compute_protection_scopes() -> list:
+async def compute_protection_scopes(activities: str = PROTECTION_SCOPE_ACTIVITIES) -> list:
     """
     Call protectionScopes/compute to discover which policies apply.
     Caches the ETag for subsequent processContent calls.
@@ -210,6 +216,10 @@ async def compute_protection_scopes() -> list:
     If omitted, all applicable policies are returned. With a single-app demo
     you'll often see the same result either way. The filter becomes most
     useful when one orchestrator protects multiple downstream apps.
+
+    'activities' is the comma-separated list of user activities the caller
+    supports (uploadText, uploadFile, downloadText, downloadFile). File
+    activities must be requested explicitly if you intend to send files.
     """
     global _cached_etag, _etag_timestamp, _protection_scopes, _last_scope_compute_ms
 
@@ -219,7 +229,7 @@ async def compute_protection_scopes() -> list:
         "Content-Type": "application/json",
     }
     body = {
-        "activities": "uploadText,downloadText",
+        "activities": activities,
         "integratedAppMetadata": get_integrated_app_metadata(),
         "locations": [build_policy_location_application(POLICY_LOCATION_APP_ID)],
     }
@@ -605,6 +615,377 @@ def render_result(result: dict | None, scenario_title: str = "") -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# FILE SUPPORT PROBE — does Purview parse Office binaries, or text only?
+# ═══════════════════════════════════════════════════════════════════════
+def build_docx_bytes(text: str) -> bytes:
+    """
+    Build a minimal but valid .docx (Office Open XML) in memory.
+
+    Written with the standard library only so the demo gains no new
+    dependencies. The document contains a single paragraph holding `text`,
+    which lets us prove whether Purview extracts text from Office binaries.
+    """
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body><w:p><w:r><w:t xml:space=\"preserve\">"
+        f"{xml_escape(text)}"
+        "</w:t></w:r></w:p></w:body></w:document>"
+    )
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        "</Types>"
+    )
+    rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="word/document.xml"/>'
+        "</Relationships>"
+    )
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types_xml)
+        archive.writestr("_rels/.rels", rels_xml)
+        archive.writestr("word/document.xml", document_xml)
+    return buffer.getvalue()
+
+
+def extract_text_from_docx(docx_bytes: bytes) -> str:
+    """
+    Client-side text extraction from a .docx — what your app must do today
+    if Purview does not parse the binary itself.
+
+    Deliberately minimal (no new dependencies): read word/document.xml and
+    concatenate the <w:t> runs. Real applications should use a proper
+    extraction library that also handles tables, headers and footnotes.
+    """
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+
+    runs = re.findall(r"<w:t[^>]*>(.*?)</w:t>", document_xml, flags=re.DOTALL)
+    text = " ".join(runs)
+    # Undo the XML escaping applied when the document was written
+    for entity, char in (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&apos;", "'"), ("&amp;", "&")):
+        text = text.replace(entity, char)
+    return text.strip()
+
+
+async def process_file_content(
+    data: str | bytes,
+    file_name: str,
+    activity: str = "uploadFile",
+) -> dict | None:
+    """
+    Evaluate a FILE against DLP policies via processContent.
+
+    Unlike process_content (which sends processConversationMetadata +
+    textContent), this sends processFileMetadata — the content entry type
+    intended for files — and picks the content type from `data`:
+
+      bytes -> microsoft.graph.binaryContent (Base64 encoded by us)
+      str   -> microsoft.graph.textContent   (already-extracted text)
+
+    Both variants are exercised by the file support probe so the difference
+    in DLP verdicts is visible side by side.
+    """
+    global _sequence_number
+
+    etag_used = bool(_cached_etag)
+    etag_age_seconds = get_etag_age_seconds()
+
+    if isinstance(data, bytes):
+        content = {
+            "@odata.type": "microsoft.graph.binaryContent",
+            "data": base64.b64encode(data).decode("ascii"),
+        }
+        original_length = len(data)
+    else:
+        content = {
+            "@odata.type": "microsoft.graph.textContent",
+            "data": data,
+        }
+        original_length = len(data.encode("utf-8"))
+
+    request_id = str(uuid.uuid4())
+    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    body = {
+        "contentToProcess": {
+            "contentEntries": [
+                {
+                    "@odata.type": "microsoft.graph.processFileMetadata",
+                    "identifier": request_id,
+                    "content": content,
+                    "name": file_name,
+                    "correlationId": _correlation_id,
+                    "sequenceNumber": _sequence_number,
+                    "isTruncated": False,
+                    "length": original_length,
+                    "createdDateTime": current_time,
+                    "modifiedDateTime": current_time,
+                }
+            ],
+            "activityMetadata": {"activity": activity},
+            "deviceMetadata": {
+                "deviceType": "Unmanaged",
+                "operatingSystemSpecifications": {
+                    "operatingSystemPlatform": "Windows 11",
+                    "operatingSystemVersion": "10.0.26100.0",
+                },
+                "ipAddress": "127.0.0.1",
+            },
+            "protectedAppMetadata": get_protected_app_metadata(),
+            "integratedAppMetadata": get_integrated_app_metadata(),
+        }
+    }
+
+    token = get_token()
+    headers = {
+        "Authorization": f"******",
+        "Content-Type": "application/json",
+    }
+    if _cached_etag:
+        headers["If-None-Match"] = _cached_etag
+
+    url = "https://graph.microsoft.com/v1.0/me/dataSecurityAndGovernance/processContent"
+
+    started_at = time.perf_counter()
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body) as resp:
+            _sequence_number += 1
+            process_duration_ms = (time.perf_counter() - started_at) * 1000
+
+            if resp.status == 200:
+                result = await resp.json()
+                result["_demo"] = {
+                    "etag_used": etag_used,
+                    "etag_age_seconds": etag_age_seconds,
+                    "process_duration_ms": process_duration_ms,
+                    "scope_refresh_reason": None,
+                    "correlation_id": _correlation_id,
+                    "sequence_number": _sequence_number - 1,
+                    "activity": activity,
+                    "content_type": content["@odata.type"],
+                    "payload_bytes": original_length,
+                }
+                return result
+
+            text_resp = await resp.text()
+            console.print(f"[red]  processContent ({activity}) returned {resp.status}[/]")
+            console.print(f"[dim]  {text_resp[:300]}[/]")
+            return {
+                "_error": {
+                    "status": resp.status,
+                    "message": text_resp[:300],
+                },
+                "_demo": {
+                    "process_duration_ms": process_duration_ms,
+                    "activity": activity,
+                    "content_type": content["@odata.type"],
+                    "payload_bytes": original_length,
+                },
+            }
+
+
+def verdict_from_result(result: dict | None) -> str:
+    """Reduce a processContent response to BLOCKED / ALLOWED / ERROR."""
+    if result is None or "_error" in result:
+        return "ERROR"
+    actions = result.get("policyActions", [])
+    if any(a.get("restrictionAction", "").lower() == "block" for a in actions):
+        return "BLOCKED"
+    return "ALLOWED"
+
+
+async def run_file_support_probe():
+    """
+    Answer empirically: does Purview classify Office file binaries, or only text?
+
+    The same sensitive string is sent three ways and the DLP verdicts compared:
+
+      A. textContent            (processConversationMetadata, uploadText)
+      B. binaryContent (.docx)  (processFileMetadata, uploadFile)
+      C. textContent (.docx)    (processFileMetadata, uploadFile, text extracted locally)
+
+    A is the control: if A does not BLOCK, your DLP policy is not matching the
+    test string and the probe cannot conclude anything about file support.
+    """
+    global _sequence_number, _correlation_id
+
+    _sequence_number = 0
+    _correlation_id = str(uuid.uuid4())
+
+    console.print()
+    console.print(Rule("[bold magenta] FILE SUPPORT PROBE — binary vs text [/]", style="magenta"))
+    console.print()
+    console.print(
+        Panel(
+            "[dim]The Graph schema exposes file content entries "
+            "([bold]processFileMetadata[/] + [bold]binaryContent[/] + activity [bold]uploadFile[/]),\n"
+            "but there is no documented list of supported file formats, and Microsoft's own\n"
+            "samples and integrations always send text.\n\n"
+            "This probe sends the SAME sensitive string three ways and compares the verdicts:[/]\n\n"
+            "  [bold]A[/]  textContent            [dim]— plain text (control)[/]\n"
+            "  [bold]B[/]  binaryContent (.docx)  [dim]— raw Office bytes, Base64 encoded[/]\n"
+            "  [bold]C[/]  textContent (.docx)    [dim]— text extracted client-side from the same .docx[/]\n\n"
+            "[dim]If A and C block but B allows, Purview is NOT parsing the Office binary and\n"
+            "your app must extract text before calling processContent.[/]",
+            title="[bold magenta]What is being tested?[/]",
+            border_style="magenta",
+            padding=(1, 2),
+        )
+    )
+
+    # Protection scopes must cover file activities, otherwise uploadFile may
+    # fall outside the computed scope and never be evaluated.
+    console.print()
+    console.print(
+        f"  [dim]Recomputing protection scopes for:[/] [bold]{FILE_PROBE_ACTIVITIES}[/]\n"
+    )
+    with console.status("[bold cyan]Computing protection scopes...", spinner="dots"):
+        scopes = await compute_protection_scopes(activities=FILE_PROBE_ACTIVITIES)
+    display_protection_scopes(scopes)
+
+    docx_bytes = build_docx_bytes(FILE_PROBE_TEXT)
+    extracted_text = extract_text_from_docx(docx_bytes)
+
+    console.print()
+    console.print(
+        f"  [dim]Test string:[/] [white]{FILE_PROBE_TEXT}[/]\n"
+        f"  [dim]Generated file:[/] [bold]{FILE_PROBE_FILE_NAME}[/] "
+        f"[dim]({len(docx_bytes)} bytes)[/]\n"
+        f"  [dim]Text extracted back out of the .docx:[/] [white]{extracted_text}[/]\n"
+    )
+
+    if extracted_text != FILE_PROBE_TEXT:
+        console.print(
+            "  [yellow]⚠ Local extraction did not round-trip the test string — "
+            "variant C is not a like-for-like comparison.[/]\n"
+        )
+
+    variants = []
+
+    with console.status("[bold magenta]A — evaluating plain text (uploadText)...", spinner="dots"):
+        result_a = await process_content(FILE_PROBE_TEXT, activity="uploadText")
+    variants.append(("A", "textContent", "uploadText", FILE_PROBE_TEXT.encode("utf-8"), result_a))
+
+    with console.status("[bold magenta]B — evaluating .docx binary (uploadFile)...", spinner="dots"):
+        result_b = await process_file_content(docx_bytes, FILE_PROBE_FILE_NAME)
+    variants.append(("B", "binaryContent (.docx)", "uploadFile", docx_bytes, result_b))
+
+    with console.status("[bold magenta]C — evaluating extracted text (uploadFile)...", spinner="dots"):
+        result_c = await process_file_content(extracted_text, FILE_PROBE_FILE_NAME)
+    variants.append(("C", "textContent (extracted)", "uploadFile", extracted_text.encode("utf-8"), result_c))
+
+    # ── Results table ────────────────────────────────────────────────
+    table = Table(
+        box=box.DOUBLE_EDGE,
+        title="File Support Probe — same sensitive string, three encodings",
+        title_style="bold magenta",
+        header_style="bold white on dark_blue",
+        show_lines=True,
+        padding=(0, 2),
+    )
+    table.add_column("#", style="dim", width=3, justify="center")
+    table.add_column("Content type", style="bold", min_width=24)
+    table.add_column("Activity", justify="center")
+    table.add_column("Payload", justify="right")
+    table.add_column("Verdict", justify="center", width=10)
+    table.add_column("Latency", justify="right")
+
+    verdicts = {}
+    for label, content_type, activity, payload, result in variants:
+        verdict = verdict_from_result(result)
+        verdicts[label] = verdict
+        demo_metadata = (result or {}).get("_demo", {})
+        verdict_style = (
+            "bold red" if verdict == "BLOCKED"
+            else "bold green" if verdict == "ALLOWED"
+            else "bold yellow"
+        )
+        table.add_row(
+            label,
+            content_type,
+            activity,
+            f"{len(payload)} B",
+            Text(verdict, style=verdict_style),
+            format_duration_ms(demo_metadata.get("process_duration_ms", 0.0)),
+        )
+
+    console.print()
+    console.print(table)
+
+    for label, _content_type, _activity, _payload, result in variants:
+        error = (result or {}).get("_error")
+        if error:
+            console.print(
+                f"    [yellow]⚠ {label} failed with HTTP {error['status']}:[/] "
+                f"[dim]{error['message']}[/]"
+            )
+        for processing_error in (result or {}).get("processingErrors", []):
+            console.print(f"    [yellow]⚠ {label} processingError:[/] [dim]{processing_error}[/]")
+
+    # ── Interpretation ───────────────────────────────────────────────
+    if verdicts.get("A") != "BLOCKED":
+        conclusion = (
+            "[bold yellow]INCONCLUSIVE[/] — the plain-text control (A) was not blocked.\n\n"
+            "Your DLP policy is not matching the test string, so nothing can be concluded\n"
+            "about file support. Fix the control first: point [bold]FILE_PROBE_TEXT[/] in config.py at\n"
+            "a string your policy definitely blocks, and confirm the policy targets this app."
+        )
+        border = "yellow"
+    elif verdicts.get("B") == "BLOCKED":
+        conclusion = (
+            "[bold green]BINARY PARSING WORKS[/] — the raw .docx (B) was blocked.\n\n"
+            "Purview extracted and classified text from the Office binary in this tenant.\n"
+            "You can send files directly as [bold]binaryContent[/] without client-side extraction."
+        )
+        border = "green"
+    elif verdicts.get("C") == "BLOCKED":
+        conclusion = (
+            "[bold red]TEXT ONLY — CONFIRMED[/] — plain text (A) and extracted text (C) were\n"
+            "blocked, but the identical content sent as a raw .docx binary (B) was not.\n\n"
+            "Purview did not parse the Office binary. Extract text from files client-side and\n"
+            "send it as [bold]textContent[/] inside [bold]processFileMetadata[/] so the file name, size and\n"
+            "owner still appear correctly in Activity Explorer and DSPM for AI."
+        )
+        border = "red"
+    else:
+        conclusion = (
+            "[bold yellow]INCONCLUSIVE[/] — plain text (A) was blocked, but neither file variant\n"
+            "(B or C) was.\n\n"
+            "This points at scope rather than format: the policy likely does not cover the\n"
+            "[bold]uploadFile[/] activity. Check the protection scopes above and add file activities\n"
+            "to the DLP policy, then re-run the probe."
+        )
+        border = "yellow"
+
+    console.print()
+    console.print(
+        Panel(
+            conclusion,
+            title="[bold]🔬 Conclusion[/]",
+            border_style=border,
+            padding=(1, 2),
+        )
+    )
+    console.print(
+        "\n  [dim]Note: all three calls are real audit records and appear in Activity Explorer\n"
+        "  and DSPM for AI, tied together by a single correlationId.[/]\n"
+    )
+
+    return verdicts
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # DEMO FLOW
 # ═══════════════════════════════════════════════════════════════════════
 async def run_demo(user: dict):
@@ -880,6 +1261,20 @@ async def main():
 
     # Run the scripted demo
     await run_demo(user)
+
+    # Offer the file support probe (binary vs text classification)
+    try:
+        choice = Prompt.ask(
+            "\n  [bold]Run the file support probe (does Purview classify .docx binaries?)[/]",
+            choices=["y", "n"],
+            default="n",
+        )
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[dim]Demo interrupted by user.[/]")
+        return
+
+    if choice == "y":
+        await run_file_support_probe()
 
     # Offer interactive mode
     try:

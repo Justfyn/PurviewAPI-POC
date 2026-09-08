@@ -74,6 +74,38 @@ DEMO_SCENARIOS = [
 ]
 
 # ──────────────────────────────────────────────────────────────────────
+# File support probe
+#
+# The Graph schema exposes file content entries (processFileMetadata +
+# binaryContent + activity uploadFile), but there is no documented list of
+# supported file formats, and Microsoft's own samples always send text.
+# This probe answers the question empirically for YOUR tenant by sending the
+# SAME sensitive string three different ways and comparing the DLP verdicts:
+#
+#   A. textContent            — plain text (the known-good baseline)
+#   B. binaryContent (.docx)  — raw Office bytes, Base64 encoded
+#   C. textContent (.docx)    — text extracted client-side from the same .docx
+#
+# If A and C block but B allows, the service is NOT parsing Office binaries
+# and you must extract text before calling processContent.
+# ──────────────────────────────────────────────────────────────────────
+# Sensitive payload used by all three probe variants. Must be something your
+# DLP policy actually blocks — reuse a string from a BLOCK scenario above.
+FILE_PROBE_TEXT = (
+    "Please update the HR record for employee SSN 120-98-1437 before payroll closes."
+)
+
+# File name reported to Purview in processFileMetadata.name
+FILE_PROBE_FILE_NAME = "payroll-update.docx"
+
+# Activities requested when computing protection scopes for the probe.
+# File activities must be included or uploadFile may fall outside scope.
+FILE_PROBE_ACTIVITIES = "uploadText,uploadFile,downloadText,downloadFile"
+
+# Activities requested for the standard scripted demo (text only).
+PROTECTION_SCOPE_ACTIVITIES = "uploadText,downloadText"
+
+# ──────────────────────────────────────────────────────────────────────
 # App metadata sent to Purview
 # ──────────────────────────────────────────────────────────────────────
 # UI / demo branding
