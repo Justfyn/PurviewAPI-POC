@@ -98,6 +98,7 @@ If your orchestrator protects content **for another app**, use:
 | **60-Minute Refresh** | Automatically re-calls Step 1 if ETag is older than 60 minutes |
 | **Conversation Tracking** | Persistent `correlationId` per session, incrementing `sequenceNumber` |
 | **Decision Trace** | Shows cache state, timing, and conversation tracking under each result |
+| **File Support Probe** | Sends the same sensitive string as text, as raw `.docx` bytes, and as extracted text — proving whether Purview classifies Office binaries |
 | **Interactive AI Chat** | Simulates a real AI assistant with live DLP enforcement + audit |
 
 ---
@@ -212,6 +213,9 @@ New-DlpComplianceRule -Name "Block Credit Cards in AI Apps" `
 
 > **Note:** DLP policies take 15-60 minutes to sync. Check status in the Purview portal under **Data Loss Prevention** → **Policies**.
 
+> **Running the file support probe?** Add the file activity to the rule so file uploads are also restricted:
+> `-RestrictAccess @(@{setting="UploadText";value="Block"}, @{setting="UploadFile";value="Block"})`
+
 ### 3. Licensing
 
 This POC uses the **Data Security — In Transit Protection** capability in Microsoft Purview (DLP enforcement via the `processContent` API). See the [Purview pricing page](https://azure.microsoft.com/en-us/pricing/details/purview/) for current meter details.
@@ -268,7 +272,8 @@ python classify_text.py
 4. **Step 2a** — `processContent(uploadText)` — 4 scripted scenarios with DLP decisions
 5. **Step 2b** — `processContent(downloadText)` — audits simulated AI responses for ALLOWED scenarios
 6. **Summary Table** — expected vs actual results with match indicators
-7. **Interactive Chat** — live AI chat with DLP enforcement + response audit
+7. **File Support Probe** *(optional)* — does Purview classify Office binaries, or text only?
+8. **Interactive Chat** — live AI chat with DLP enforcement + response audit
 
 Each scenario pauses for `[Enter]` so the presenter can explain what's about to happen.
 
@@ -329,6 +334,32 @@ POST /me/dataSecurityAndGovernance/activities/contentActivities
 - Requires `ContentActivity.Write`
 - Think of it as: “don’t enforce, just log”
 
+### Step 3 — Files (`uploadFile` / `downloadFile`)
+
+```http
+POST /me/dataSecurityAndGovernance/processContent
+  activity: "uploadFile"
+```
+
+The Graph v1.0 schema has first-class support for files, not just conversation text:
+
+| Type | Purpose |
+|------|---------|
+| `microsoft.graph.processConversationMetadata` | Prompts and responses — used by Steps 2a/2b |
+| `microsoft.graph.processFileMetadata` | Files — adds `ownerId` and `customProperties` |
+| `microsoft.graph.textContent` | Content as a plain string |
+| `microsoft.graph.binaryContent` | Content as a Base64-encoded byte stream |
+
+The `userActivityType` enum includes `uploadText`, `uploadFile`, `downloadText`, `downloadFile`. Request the file activities in Step 1 (`activities: "uploadText,uploadFile,downloadText,downloadFile"`) or `uploadFile` may fall outside the computed scope.
+
+**Important caveat:** the schema accepting `binaryContent` does not mean the service parses every file format. There is **no documented list of supported file formats** in the `processContent` reference, the documented size limit is expressed in terms of **text** (2 MB per content entry, max 64 entries per request), and Microsoft's own code sends text only:
+
+- The v1.0 "Network provider app with file content" example uses `processFileMetadata` and `activity: uploadFile` — but its content block is `textContent` with a `"Base64 encoded content"` placeholder, contradicting the `processFileMetadata` schema, which shows `binaryContent`.
+- [`microsoft/PurviewIntegrations`](https://github.com/microsoft/PurviewIntegrations) (the Purview GitHub Action that scans repository files) explicitly **skips binary files** and always builds `microsoft.graph.textContent`.
+- [`microsoft/agent-framework`](https://github.com/microsoft/agent-framework) defines a `PurviewBinaryContent` model but never constructs it — the processor only ever sends `PurviewTextContent`.
+
+The practical guidance today: **extract text from files client-side**, send it as `textContent` **inside** `processFileMetadata` so the file name, size, and owner still land correctly in Activity Explorer and DSPM for AI. Use the file support probe below to verify this for your own tenant.
+
 ### Key Behaviors
 
 | Behavior | Details |
@@ -339,6 +370,50 @@ POST /me/dataSecurityAndGovernance/activities/contentActivities
 | **Conversation Tracking** | `correlationId` per session, `sequenceNumber` increments per message |
 | **Collection Policy** | Required for auditing (Activity Explorer, DSPM for AI, eDiscovery). NOT required for DLP enforcement. |
 | **compute vs processContent** | `compute` is the pre-flight hint; `processContent` is the real transaction and the final content-level decision point. |
+| **Files vs text** | `processFileMetadata` + `binaryContent` exist in the schema, but no file format list is documented. Verify with the file support probe before relying on binary parsing. |
+
+---
+
+## File Support Probe
+
+Answers empirically, for **your** tenant: *does Purview classify Office file binaries, or only text?*
+
+```bash
+python classify_text.py
+# ... then answer "y" at: Run the file support probe?
+```
+
+The probe sends the **same sensitive string three ways** and compares the DLP verdicts:
+
+| # | Content entry | Content type | Activity | What it proves |
+|---|---------------|--------------|----------|----------------|
+| **A** | `processConversationMetadata` | `textContent` | `uploadText` | Control — the policy really does block this string |
+| **B** | `processFileMetadata` | `binaryContent` (raw `.docx` bytes, Base64) | `uploadFile` | Whether the service parses Office binaries |
+| **C** | `processFileMetadata` | `textContent` (text extracted locally from the same `.docx`) | `uploadFile` | Whether the file path works once you extract text yourself |
+
+The `.docx` is generated in memory with the standard library (`zipfile` + minimal OOXML parts), so the demo gains no new dependencies and the file content is known exactly.
+
+**Reading the result:**
+
+| A | B | C | Conclusion |
+|---|---|---|------------|
+| BLOCKED | BLOCKED | — | Binary parsing works — send files directly as `binaryContent` |
+| BLOCKED | ALLOWED | BLOCKED | **Text only** — extract text client-side, send as `textContent` inside `processFileMetadata` |
+| BLOCKED | ALLOWED | ALLOWED | Inconclusive — the policy likely doesn't cover the `uploadFile` activity |
+| ALLOWED | — | — | Inconclusive — the control failed; your policy isn't matching the test string |
+
+**Configuration** (`config.py`):
+
+| Setting | Purpose |
+|---------|---------|
+| `FILE_PROBE_TEXT` | Sensitive string used by all three variants. Must be something your DLP policy actually blocks. |
+| `FILE_PROBE_FILE_NAME` | File name reported in `processFileMetadata.name` |
+| `FILE_PROBE_ACTIVITIES` | Activities requested in Step 1 for the probe (includes `uploadFile` / `downloadFile`) |
+| `PROTECTION_SCOPE_ACTIVITIES` | Activities requested in Step 1 for the standard text demo |
+
+For a BLOCK verdict on the file variants, the DLP policy must also restrict the file activity — add `UploadFile` alongside `UploadText` in `-RestrictAccess`.
+
+All three calls are real audit records and appear in Activity Explorer and DSPM for AI, tied together by a single `correlationId`.
 
 ---
 
@@ -626,6 +701,72 @@ Content-Type: application/json
 }
 ```
 
+### 5. `processContent` with `uploadFile` — “Can I let this file through?”
+
+Same endpoint, different content entry type. `processFileMetadata` adds file-shaped
+metadata (`ownerId`, `customProperties`, `length`) so the activity shows up as a file
+in Activity Explorer.
+
+```http
+POST https://graph.microsoft.com/v1.0/me/dataSecurityAndGovernance/processContent
+Authorization: ******
+Content-Type: application/json
+If-None-Match: "<etag-from-compute>"
+
+{
+  "contentToProcess": {
+    "contentEntries": [
+      {
+        "@odata.type": "microsoft.graph.processFileMetadata",
+        "identifier": "file-001",
+        "content": {
+          "@odata.type": "microsoft.graph.binaryContent",
+          "data": "<Base64-encoded file bytes>"
+        },
+        "name": "payroll-update.docx",
+        "correlationId": "thread-003",
+        "sequenceNumber": 0,
+        "length": 17352,
+        "isTruncated": false,
+        "ownerId": "<entra-user-id>",
+        "customProperties": {
+          "Department": "Finance"
+        },
+        "createdDateTime": "2026-03-13T12:10:00Z",
+        "modifiedDateTime": "2026-03-13T12:10:00Z"
+      }
+    ],
+    "activityMetadata": {
+      "activity": "uploadFile"
+    },
+    "deviceMetadata": {
+      "deviceType": "Unmanaged",
+      "operatingSystemSpecifications": {
+        "operatingSystemPlatform": "Windows 11",
+        "operatingSystemVersion": "10.0.26100.0"
+      },
+      "ipAddress": "127.0.0.1"
+    },
+    "integratedAppMetadata": {
+      "name": "Contoso Orchestrator",
+      "version": "1.0"
+    },
+    "protectedAppMetadata": {
+      "name": "Contoso HR App",
+      "version": "1.0",
+      "applicationLocation": {
+        "@odata.type": "microsoft.graph.policyLocationApplication",
+        "value": "<protected-app-id>"
+      }
+    }
+  }
+}
+```
+
+> Swap `binaryContent` for `textContent` (with text you extracted from the file) if the
+> file support probe shows that binaries are not classified in your tenant. Everything
+> else in the payload stays the same.
+
 ## FAQ — Latest Customer Confusion
 
 ### What exactly is a policy location?
@@ -675,6 +816,12 @@ Target the app/location you actually want to govern. If the orchestrator is prot
 
 That is mostly terminology. The enforcement plane is being renamed from **Entra** to **Application**. For the purposes of this POC, treat them as the same concept unless Microsoft documentation explicitly tells you otherwise.
 
+### Are files supported, or is it text only?
+
+Structurally, files are supported: `processFileMetadata`, `binaryContent`, and the `uploadFile` / `downloadFile` activities are all in the Graph **v1.0** schema.
+
+In practice, the classification engine is documented and exercised around **text**. No supported file format list is published, the size limit is stated in terms of text (2 MB per entry), and Microsoft's own file-scanning integration skips binaries and sends `textContent`. Assume you must extract text from Office/PDF files yourself, and use the **File Support Probe** in this demo to confirm the behaviour in your tenant before designing around it.
+
 ---
 
 ## Validation Checklist
@@ -684,6 +831,7 @@ After running the demo, verify activity appears in these Purview locations:
 | Portal | What to Check |
 |--------|---------------|
 | **DSPM for AI** → Activity Explorer | User prompts (uploadText) AND AI responses (downloadText) with BLOCK/ALLOW status |
+| **DSPM for AI** → Activity Explorer | File activity (uploadFile) if you ran the file support probe |
 | **Audit** → Search | `DLPRuleMatch` events for your app |
 | **Insider Risk Management** | Policy triggers if configured |
 | **Communication Compliance** | Chat messages if policy is set |
@@ -700,8 +848,8 @@ For detailed validation guidance, see [How to Test an AI Application Integrated 
 PurviewAPI_POC/
 ├── README.md           # This file — demo guide and documentation
 ├── requirements.txt    # Python dependencies (rich, aiohttp, azure-identity)
-├── config.py           # Configuration, credentials, demo scenarios
-├── classify_text.py    # Main demo script — two-step flow + rich UI
+├── config.py           # Configuration, credentials, demo scenarios, file probe settings
+├── classify_text.py    # Main demo script — two-step flow + file support probe + rich UI
 └── .gitignore          # Excludes .venv, __pycache__, etc.
 ```
 
@@ -718,6 +866,8 @@ PurviewAPI_POC/
 | integratedApplicationMetadata | https://learn.microsoft.com/en-us/graph/api/resources/integratedapplicationmetadata |
 | protectedApplicationMetadata | https://learn.microsoft.com/en-us/graph/api/resources/protectedapplicationmetadata |
 | policyLocationApplication | https://learn.microsoft.com/en-us/graph/api/resources/policylocationapplication |
+| processFileMetadata (file content entries) | https://learn.microsoft.com/en-us/graph/api/resources/processfilemetadata |
+| binaryContent (Base64 file bytes) | https://learn.microsoft.com/en-us/graph/api/resources/binarycontent |
 | Configure Purview for AI Apps | https://learn.microsoft.com/en-us/purview/developer/configurepurview |
 | Testing Guide | https://learn.microsoft.com/en-us/purview/developer/how-to-test-an-ai-application-integrated-with-purview-sdk |
 | Purview Data Security for GenAI | https://learn.microsoft.com/en-us/purview/developer/purview-data-security-genai |
