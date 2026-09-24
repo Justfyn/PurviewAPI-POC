@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Optional companion; Purview integration is a preview package.
+agent-framework-core==1.19.0
+agent-framework-openai==1.14.4
+agent-framework-purview==1.0.0b260918
+openai==3.19.2
