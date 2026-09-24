@@ -39,8 +39,8 @@ SCOPES = [
 #   - expect: expected DLP decision for the prompt
 #
 # The downloadText call sends the AI response to Purview for auditing.
-# This ensures both prompts AND responses appear in Activity Explorer,
-# DSPM for AI, eDiscovery, Insider Risk, etc.
+# Portal visibility also requires collection configuration and ingestion;
+# successful submission alone does not verify arrival.
 # ──────────────────────────────────────────────────────────────────────
 DEMO_SCENARIOS = [
     {
@@ -77,17 +77,17 @@ DEMO_SCENARIOS = [
 # File support probe
 #
 # The Graph schema exposes file content entries (processFileMetadata +
-# binaryContent + activity uploadFile), but there is no documented list of
-# supported file formats, and Microsoft's own samples always send text.
-# This probe answers the question empirically for YOUR tenant by sending the
+# binaryContent + activity uploadFile). Binary transport does not guarantee
+# parsing or label enforcement for every format.
+# This probe compares behavior for one fixture in YOUR tenant by sending the
 # SAME sensitive string three different ways and comparing the DLP verdicts:
 #
 #   A. textContent            — plain text (the known-good baseline)
 #   B. binaryContent (.docx)  — raw Office bytes, Base64 encoded
 #   C. textContent (.docx)    — text extracted client-side from the same .docx
 #
-# If A and C block but B allows, the service is NOT parsing Office binaries
-# and you must extract text before calling processContent.
+# If A and C block but B allows, use extracted text for this path and investigate
+# parsing/policy differences; do not generalize the result to all Office files.
 # ──────────────────────────────────────────────────────────────────────
 # Sensitive payload used by all three probe variants. Must be something your
 # DLP policy actually blocks — reuse a string from a BLOCK scenario above.

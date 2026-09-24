@@ -11,6 +11,7 @@ Demonstrates the two-step Purview API integration:
 Usage:
     pip install -r requirements.txt
     python classify_text.py
+    python classify_text.py --failure-demo  # offline, synthetic failures only
 """
 
 import asyncio
@@ -58,12 +59,175 @@ console = Console()
 _credential: InteractiveBrowserCredential | None = None
 _cached_etag: str | None = None
 _etag_timestamp: float = 0
-_protection_scopes: list = []
+_protection_scopes: list | None = None
 _sequence_number: int = 0
 _correlation_id: str = str(uuid.uuid4())
 _last_scope_compute_ms: float = 0.0
 
 ETAG_REFRESH_SECONDS = 3600  # 60 minutes
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+
+
+def begin_conversation(correlation_id: str) -> None:
+    """Start a shared conversation trace without changing cached policy scopes."""
+    global _correlation_id, _sequence_number
+    _correlation_id = correlation_id
+    _sequence_number = 0
+
+
+def _failure_result(kind: str, status: int | None = None) -> dict:
+    """Keep diagnostics useful without retaining response bodies or exceptions."""
+    error = {"kind": kind}
+    if status is not None:
+        error["status"] = status
+    return {"_error": error}
+
+
+def _has_processing_errors(result: dict) -> bool:
+    return "processingErrors" in result and result["processingErrors"] != []
+
+
+def _is_block_action(action) -> bool:
+    if not isinstance(action, dict):
+        return False
+    restriction = action.get("restrictionAction")
+    return (
+        isinstance(restriction, str)
+        and restriction.lower() == "block"
+        and action.get("action", "restrictAccess") == "restrictAccess"
+        and action.get("@odata.type", "#microsoft.graph.restrictAccessAction")
+        in ("#microsoft.graph.restrictAccessAction", "microsoft.graph.restrictAccessAction")
+    )
+
+
+def verdict_from_result(result: dict | None) -> str:
+    """Fail closed, distinguishing missing coverage from failed evaluation.
+
+    Only restrictAccess/block is implemented. Any other nonempty action needs
+    enforcement support before it can authorize forwarding. Legacy block
+    responses without action/type discriminators remain supported.
+    """
+    if not isinstance(result, dict):
+        return "EVALUATION_INCOMPLETE"
+    actions = result.get("policyActions")
+    if isinstance(actions, list) and any(_is_block_action(action) for action in actions):
+        return "BLOCKED"
+    if "_error" in result or "error" in result or _has_processing_errors(result):
+        return "EVALUATION_INCOMPLETE"
+    if "_coverage" in result:
+        coverage = result["_coverage"]
+        if not isinstance(coverage, list):
+            return "EVALUATION_INCOMPLETE"
+        if not coverage:
+            return "NO_POLICY_COVERAGE"
+    if not isinstance(actions, list) or actions:
+        return "EVALUATION_INCOMPLETE"
+    return "ALLOWED"
+
+
+async def _graph_request(
+    method: str,
+    url: str,
+    body: dict | None = None,
+    use_etag: bool = False,
+    accepted_statuses: tuple = (200,),
+    headers: dict | None = None,
+) -> tuple[dict, dict]:
+    """Bound requests and return redacted failures, never raw error bodies."""
+    entries = (body or {}).get("contentToProcess", {}).get("contentEntries", [])
+    request_id = entries[0]["identifier"] if entries else str(uuid.uuid4())
+    trace = {
+        "request_id": request_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "correlation_id": _correlation_id,
+    }
+    if headers is None:
+        try:
+            token = get_token()
+        except Exception:
+            result = _failure_result("authentication_failed")
+            result["_demo"] = trace
+            return result, {}
+        headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+    headers = dict(headers)
+    headers["client-request-id"] = request_id
+    headers["return-client-request-id"] = "true"
+    if use_etag and _cached_etag:
+        headers["If-None-Match"] = _cached_etag
+
+    response_headers = {}
+    try:
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+            async with session.request(method, url, headers=headers, json=body) as resp:
+                trace["http_status"] = resp.status
+                response_headers = dict(resp.headers)
+                if resp.status not in accepted_statuses:
+                    result = _failure_result("http_error", resp.status)
+                elif resp.status in (202, 204):
+                    result = {}
+                else:
+                    result = await resp.json()
+                    if not isinstance(result, dict):
+                        result = _failure_result("malformed_response")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        result = _failure_result("transport_or_response_failure")
+    result["_demo"] = trace
+    return result, response_headers
+
+
+async def _evaluate_content_request(
+    body: dict, scope_activities: str = PROTECTION_SCOPE_ACTIVITIES, audit: bool = False,
+    headers: dict | None = None,
+) -> dict:
+    global _sequence_number
+
+    started_at = time.perf_counter()
+    scope_refresh_reason = None
+    if _etag_timestamp > 0 and time.time() - _etag_timestamp > ETAG_REFRESH_SECONDS:
+        scope_refresh_reason = "Scope cache expired"
+        await compute_protection_scopes(activities=scope_activities)
+    etag_used = bool(_cached_etag)
+    etag_age_seconds = get_etag_age_seconds()
+    entry = body["contentToProcess"]["contentEntries"][0]
+
+    if not _protection_scopes:
+        result = (
+            _failure_result("protection_scopes_unavailable")
+            if _protection_scopes is None
+            else {"_coverage": []}
+        )
+        result["_demo"] = {
+            "request_id": entry["identifier"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "correlation_id": _correlation_id,
+        }
+    else:
+        _sequence_number += 1
+        result, _ = await _graph_request(
+            "POST",
+            "https://graph.microsoft.com/v1.0/me/dataSecurityAndGovernance/processContent",
+            body,
+            use_etag=True,
+            accepted_statuses=(200, 202, 204) if audit else (200,),
+            headers=headers,
+        )
+        if result.get("protectionScopeState") == "modified":
+            scope_refresh_reason = "Purview reported modified protection scope"
+            refreshed_scopes = await compute_protection_scopes(activities=scope_activities)
+            if refreshed_scopes is None:
+                result["_error"] = {"kind": "scope_refresh_failed"}
+            elif not refreshed_scopes:
+                result["_coverage"] = []
+
+    result["_demo"].update({
+        "etag_used": etag_used,
+        "etag_age_seconds": etag_age_seconds,
+        "process_duration_ms": (time.perf_counter() - started_at) * 1000,
+        "scope_refresh_reason": scope_refresh_reason,
+        "sequence_number": entry["sequenceNumber"],
+        "activity": body["contentToProcess"]["activityMetadata"]["activity"],
+    })
+    return result
 
 
 def format_duration_ms(duration_ms: float) -> str:
@@ -184,25 +348,21 @@ async def authenticate() -> dict | None:
         try:
             token = get_token()
             headers = {"Authorization": f"Bearer {token}"}
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://graph.microsoft.com/v1.0/me",
-                    headers=headers,
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    else:
-                        body = await resp.text()
-                        console.print(f"[bold red]Failed to get user profile ({resp.status}):[/] {body[:200]}")
-        except Exception as e:
-            console.print(f"[bold red]Authentication failed:[/] {e}")
+            result, _ = await _graph_request(
+                "GET", "https://graph.microsoft.com/v1.0/me", headers=headers,
+            )
+            if "_error" not in result and "error" not in result:
+                return result
+            console.print("[bold red]Authentication/profile request failed; details withheld.[/]")
+        except Exception:
+            console.print("[bold red]Authentication failed; details withheld.[/]")
     return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # STEP 1 — COMPUTE PROTECTION SCOPES
 # ═══════════════════════════════════════════════════════════════════════
-async def compute_protection_scopes(activities: str = PROTECTION_SCOPE_ACTIVITIES) -> list:
+async def compute_protection_scopes(activities: str = PROTECTION_SCOPE_ACTIVITIES) -> list | None:
     """
     Call protectionScopes/compute to discover which policies apply.
     Caches the ETag for subsequent processContent calls.
@@ -223,7 +383,14 @@ async def compute_protection_scopes(activities: str = PROTECTION_SCOPE_ACTIVITIE
     """
     global _cached_etag, _etag_timestamp, _protection_scopes, _last_scope_compute_ms
 
-    token = get_token()
+    _cached_etag = None
+    _etag_timestamp = 0
+    _protection_scopes = None
+    try:
+        token = get_token()
+    except Exception:
+        console.print("[yellow]Scope authentication failed: EVALUATION_INCOMPLETE.[/]")
+        return None
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -237,27 +404,52 @@ async def compute_protection_scopes(activities: str = PROTECTION_SCOPE_ACTIVITIE
 
     started_at = time.perf_counter()
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=body) as resp:
-            _last_scope_compute_ms = (time.perf_counter() - started_at) * 1000
-            etag = resp.headers.get("ETag")
-            if etag:
-                _cached_etag = etag
-                _etag_timestamp = time.time()
+    data, response_headers = await _graph_request("POST", url, body, headers=headers)
+    _last_scope_compute_ms = (time.perf_counter() - started_at) * 1000
+    scopes = data.get("value")
+    if (
+        "_error" in data
+        or "error" in data
+        or _has_processing_errors(data)
+        or not isinstance(scopes, list)
+        or any(not _valid_scope(scope) for scope in scopes)
+    ):
+        console.print(
+            "[yellow]protectionScopes/compute: EVALUATION_INCOMPLETE. "
+            "Scope discovery failed; cached scopes invalidated.[/]"
+        )
+        return None
 
-            if resp.status == 200:
-                data = await resp.json()
-                _protection_scopes = data.get("value", [])
-                return _protection_scopes
-            else:
-                text = await resp.text()
-                console.print(f"[yellow]protectionScopes/compute returned {resp.status}[/]")
-                console.print(f"[dim]{text[:300]}[/dim]")
-                return []
+    _cached_etag = next(
+        (value for key, value in response_headers.items() if key.lower() == "etag"), None
+    )
+    _etag_timestamp = time.time()
+    _protection_scopes = scopes
+    return scopes
+
+
+def _valid_scope(scope) -> bool:
+    if not isinstance(scope, dict):
+        return False
+    return (
+        isinstance(scope.get("activities", ""), str)
+        and isinstance(scope.get("executionMode", ""), str)
+        and isinstance(scope.get("policyActions", []), list)
+        and all(isinstance(action, dict) for action in scope.get("policyActions", []))
+        and isinstance(scope.get("locations", []), list)
+        and all(isinstance(location, dict) for location in scope.get("locations", []))
+    )
 
 
 def display_protection_scopes(scopes: list):
     """Render protection scopes in a rich table."""
+    if scopes is None:
+        console.print(Panel(
+            "[bold yellow]EVALUATION_INCOMPLETE[/] — Protection scopes unavailable.\n"
+            "This is not evidence that no policies apply. Requests remain held.",
+            border_style="yellow",
+        ))
+        return
     table = Table(
         title="Protection Scopes for Current User",
         box=box.HEAVY_EDGE,
@@ -336,22 +528,8 @@ async def process_content(text: str, activity: str = "uploadText") -> dict | Non
     Evaluate text against DLP policies via processContent.
     Uses cached ETag from protectionScopes/compute.
     """
-    global _cached_etag, _etag_timestamp, _sequence_number
-
-    etag_used = bool(_cached_etag)
-    etag_age_seconds = get_etag_age_seconds()
-    scope_refresh_reason: str | None = None
-
-    # Refresh scopes if stale (> 60 min)
-    if _etag_timestamp > 0 and (time.time() - _etag_timestamp > ETAG_REFRESH_SECONDS):
-        console.print("[yellow]  ↻ ETag expired (>60 min) — refreshing protection scopes...[/]")
-        scope_refresh_reason = "ETag expired"
-        await compute_protection_scopes()
-        etag_used = bool(_cached_etag)
-        etag_age_seconds = get_etag_age_seconds()
-
     request_id = str(uuid.uuid4())
-    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    current_time = datetime.now(timezone.utc).isoformat()
 
     body = {
         "contentToProcess": {
@@ -385,50 +563,17 @@ async def process_content(text: str, activity: str = "uploadText") -> dict | Non
         }
     }
 
-    token = get_token()
+    try:
+        token = get_token()
+    except Exception:
+        return _failure_result("authentication_failed")
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    if _cached_etag:
-        headers["If-None-Match"] = _cached_etag
-
-    url = "https://graph.microsoft.com/v1.0/me/dataSecurityAndGovernance/processContent"
-
-    started_at = time.perf_counter()
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=body) as resp:
-            _sequence_number += 1
-            process_duration_ms = (time.perf_counter() - started_at) * 1000
-
-            if resp.status == 200:
-                result = await resp.json()
-
-                # Check if policies changed
-                scope_state = result.get("protectionScopeState", "")
-                if scope_state == "modified":
-                    console.print(
-                        "[yellow]  ⚡ Policy state changed — refreshing protection scopes...[/]"
-                    )
-                    scope_refresh_reason = "Purview reported modified protection scope"
-                    await compute_protection_scopes()
-
-                result["_demo"] = {
-                    "etag_used": etag_used,
-                    "etag_age_seconds": etag_age_seconds,
-                    "process_duration_ms": process_duration_ms,
-                    "scope_refresh_reason": scope_refresh_reason,
-                    "correlation_id": _correlation_id,
-                    "sequence_number": _sequence_number - 1,
-                }
-
-                return result
-            else:
-                text_resp = await resp.text()
-                console.print(f"[red]  processContent returned {resp.status}[/]")
-                console.print(f"[dim]  {text_resp[:300]}[/]")
-                return None
+    if activity == "uploadText":
+        headers["Prefer"] = "evaluateInline"
+    return await _evaluate_content_request(body, headers=headers)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -437,16 +582,11 @@ async def process_content(text: str, activity: str = "uploadText") -> dict | Non
 async def audit_ai_response(ai_text: str) -> dict | None:
     """
     Send the AI-generated response to Purview via processContent with
-    activity='downloadText'. This audits the response so it appears in
-    Activity Explorer, DSPM for AI, eDiscovery, Insider Risk, etc.
-
-    Per the protection scopes, downloadText uses evaluateOffline — meaning
-    we fire this asynchronously and do NOT block the user while waiting.
+    activity='downloadText'. API acceptance does not verify portal arrival.
+    Purview evaluates offline; this demo still awaits HTTP acknowledgement.
     """
-    global _sequence_number
-
     request_id = str(uuid.uuid4())
-    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    current_time = datetime.now(timezone.utc).isoformat()
 
     body = {
         "contentToProcess": {
@@ -480,67 +620,69 @@ async def audit_ai_response(ai_text: str) -> dict | None:
         }
     }
 
-    token = get_token()
+    try:
+        token = get_token()
+    except Exception:
+        return _failure_result("authentication_failed")
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    if _cached_etag:
-        headers["If-None-Match"] = _cached_etag
-
-    url = "https://graph.microsoft.com/v1.0/me/dataSecurityAndGovernance/processContent"
-
-    started_at = time.perf_counter()
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=body) as resp:
-            _sequence_number += 1
-            duration_ms = (time.perf_counter() - started_at) * 1000
-
-            if resp.status in (200, 202, 204):
-                result = await resp.json() if resp.status == 200 else {}
-                result["_demo"] = {
-                    "activity": "downloadText",
-                    "audit_duration_ms": duration_ms,
-                }
-                return result
-            else:
-                text_resp = await resp.text()
-                console.print(f"[yellow]  downloadText audit returned {resp.status}[/]")
-                console.print(f"[dim]  {text_resp[:300]}[/]")
-                return None
+    result = await _evaluate_content_request(body, audit=True, headers=headers)
+    result["_demo"]["audit_duration_ms"] = result["_demo"]["process_duration_ms"]
+    return result
 
 
 def render_audit_result(result: dict | None):
-    """Show a compact audit confirmation for the downloadText call."""
-    if result is None:
-        console.print("    [yellow]\u26a0 AI response audit: failed to send[/]")
+    """Distinguish HTTP acknowledgement from verified audit ingestion."""
+    if not isinstance(result, dict) or "_error" in result or "error" in result:
+        console.print("    [yellow]AI response audit: EVALUATION_INCOMPLETE; send not confirmed.[/]")
+        return
+    if _has_processing_errors(result):
+        console.print(
+            "    [yellow]AI response audit: EVALUATION_INCOMPLETE; processingErrors reported "
+            "(details withheld). Portal arrival not verified.[/]"
+        )
+        return
+
+    if verdict_from_result(result) == "NO_POLICY_COVERAGE":
+        console.print(
+            "    [yellow]AI response audit: NO_POLICY_COVERAGE; "
+            "scope discovery succeeded with no applicable scopes. Audit not sent.[/]"
+        )
         return
 
     demo = result.get("_demo", {})
+    if not isinstance(demo, dict):
+        demo = {}
+    if demo.get("http_status") not in (202, 204) and verdict_from_result(result) == "EVALUATION_INCOMPLETE":
+        console.print(
+            "    [yellow]AI response audit: EVALUATION_INCOMPLETE; "
+            "no complete supported response. Portal arrival not verified.[/]"
+        )
+        return
     duration = demo.get("audit_duration_ms", 0)
     console.print(
-        f"    [dim]\u2713 AI response audited in Purview[/] "
-        f"[dim]({duration:.0f} ms, activity: downloadText)[/]"
+        f"    [dim]AI response audit request acknowledged ({duration:.0f} ms, downloadText). "
+        "Portal arrival not verified.[/]"
     )
+    if verdict_from_result(result) == "BLOCKED":
+        console.print("    [yellow]Audit response includes a block action.[/]")
+    for field in ("correlation_id", "request_id", "timestamp"):
+        if demo.get(field):
+            console.print(f"    {field}: {demo[field]}", markup=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # RESULT RENDERING
 # ═══════════════════════════════════════════════════════════════════════
 def render_result(result: dict | None, scenario_title: str = "") -> str:
-    """Pretty-print a processContent result. Returns 'BLOCKED' or 'ALLOWED'."""
-    if result is None:
-        console.print(Panel("  [bold red]ERROR[/] — Could not evaluate", border_style="red"))
-        return "ERROR"
-
-    actions = result.get("policyActions", [])
-    errors = result.get("processingErrors", [])
+    """Render the same fail-closed verdict used by every execution path."""
+    verdict = verdict_from_result(result)
+    result = result if isinstance(result, dict) else {}
     demo_metadata = result.get("_demo", {})
-
-    blocked = any(
-        a.get("restrictionAction", "").lower() == "block" for a in actions
-    )
+    if not isinstance(demo_metadata, dict):
+        demo_metadata = {}
 
     trace_table = Table(
         box=box.SIMPLE_HEAD,
@@ -564,12 +706,42 @@ def render_result(result: dict | None, scenario_title: str = "") -> str:
     )
     trace_table.add_row(
         "correlation",
-        str(demo_metadata.get("correlation_id", "n/a"))[:12],
+        str(demo_metadata.get("correlation_id", "n/a")),
     )
+    trace_table.add_row("request ID", str(demo_metadata.get("request_id", "n/a")))
+    trace_table.add_row("UTC timestamp", str(demo_metadata.get("timestamp", "n/a")))
+    if "http_status" in demo_metadata:
+        trace_table.add_row("HTTP status", str(demo_metadata["http_status"]))
     if demo_metadata.get("scope_refresh_reason"):
         trace_table.add_row("scope refresh", str(demo_metadata["scope_refresh_reason"]))
 
-    if blocked:
+    if _has_processing_errors(result):
+        console.print("[yellow]processingErrors reported; details withheld.[/]")
+    if "_error" in result or "error" in result:
+        console.print("[yellow]Request or scope evaluation failed; details withheld.[/]")
+
+    if verdict == "NO_POLICY_COVERAGE":
+        console.print(Panel(
+            "[bold yellow]NO_POLICY_COVERAGE[/]\n"
+            "Scope discovery succeeded with an empty scope list; no applicable policy coverage.\n"
+            "This is not a discovery failure or an allow decision. Request held.\n"
+            "No model response or external action is permitted.",
+            border_style="yellow",
+        ))
+        console.print(trace_table)
+        return verdict
+
+    if verdict == "EVALUATION_INCOMPLETE":
+        console.print(Panel(
+            "[bold yellow]EVALUATION_INCOMPLETE[/]\n"
+            "No complete supported policy decision. Request held (fail closed).\n"
+            "No model response or external action is permitted.",
+            border_style="yellow",
+        ))
+        console.print(trace_table)
+        return verdict
+
+    if verdict == "BLOCKED":
         block_content = Text()
         block_content.append("  🛑  BLOCKED  🛑\n\n", style="bold red")
         block_content.append("  DLP policy violation detected.\n", style="red")
@@ -585,18 +757,13 @@ def render_result(result: dict | None, scenario_title: str = "") -> str:
         console.print(block_panel)
         console.print(trace_table)
 
-        # Show which actions triggered
-        for a in actions:
-            console.print(
-                f"    [red]►[/] Action: [bold]{a.get('action', '?')}[/] → "
-                f"[bold red]{a.get('restrictionAction', '?')}[/]"
-            )
+        console.print("    [red]►[/] Action: [bold]restrictAccess[/] → [bold red]block[/]")
         return "BLOCKED"
     else:
         allow_content = Text()
         allow_content.append("  ✅  ALLOWED  ✅\n\n", style="bold green")
         allow_content.append("  No DLP policy violations detected.\n", style="green")
-        allow_content.append("  Next: the app can safely forward the prompt to the AI model.", style="bold green")
+        allow_content.append("  Next: the app may forward under this completed DLP decision.", style="bold green")
 
         allow_panel = Panel(
             Align.center(allow_content),
@@ -606,10 +773,6 @@ def render_result(result: dict | None, scenario_title: str = "") -> str:
         )
         console.print(allow_panel)
         console.print(trace_table)
-
-        if errors:
-            for e in errors:
-                console.print(f"    [yellow]⚠ Error:[/] {e}")
 
         return "ALLOWED"
 
@@ -623,7 +786,7 @@ def build_docx_bytes(text: str) -> bytes:
 
     Written with the standard library only so the demo gains no new
     dependencies. The document contains a single paragraph holding `text`,
-    which lets us prove whether Purview extracts text from Office binaries.
+    which lets us compare decisions for text and Office bytes in one tenant.
     """
     document_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -695,11 +858,6 @@ async def process_file_content(
     Both variants are exercised by the file support probe so the difference
     in DLP verdicts is visible side by side.
     """
-    global _sequence_number
-
-    etag_used = bool(_cached_etag)
-    etag_age_seconds = get_etag_age_seconds()
-
     if isinstance(data, bytes):
         content = {
             "@odata.type": "microsoft.graph.binaryContent",
@@ -714,7 +872,7 @@ async def process_file_content(
         original_length = len(data.encode("utf-8"))
 
     request_id = str(uuid.uuid4())
-    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    current_time = datetime.now(timezone.utc).isoformat()
 
     body = {
         "contentToProcess": {
@@ -746,68 +904,27 @@ async def process_file_content(
         }
     }
 
-    token = get_token()
+    try:
+        token = get_token()
+    except Exception:
+        return _failure_result("authentication_failed")
     headers = {
-        "Authorization": f"******",
+        "Authorization": "Bearer " + token,
         "Content-Type": "application/json",
     }
-    if _cached_etag:
-        headers["If-None-Match"] = _cached_etag
-
-    url = "https://graph.microsoft.com/v1.0/me/dataSecurityAndGovernance/processContent"
-
-    started_at = time.perf_counter()
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=body) as resp:
-            _sequence_number += 1
-            process_duration_ms = (time.perf_counter() - started_at) * 1000
-
-            if resp.status == 200:
-                result = await resp.json()
-                result["_demo"] = {
-                    "etag_used": etag_used,
-                    "etag_age_seconds": etag_age_seconds,
-                    "process_duration_ms": process_duration_ms,
-                    "scope_refresh_reason": None,
-                    "correlation_id": _correlation_id,
-                    "sequence_number": _sequence_number - 1,
-                    "activity": activity,
-                    "content_type": content["@odata.type"],
-                    "payload_bytes": original_length,
-                }
-                return result
-
-            text_resp = await resp.text()
-            console.print(f"[red]  processContent ({activity}) returned {resp.status}[/]")
-            console.print(f"[dim]  {text_resp[:300]}[/]")
-            return {
-                "_error": {
-                    "status": resp.status,
-                    "message": text_resp[:300],
-                },
-                "_demo": {
-                    "process_duration_ms": process_duration_ms,
-                    "activity": activity,
-                    "content_type": content["@odata.type"],
-                    "payload_bytes": original_length,
-                },
-            }
-
-
-def verdict_from_result(result: dict | None) -> str:
-    """Reduce a processContent response to BLOCKED / ALLOWED / ERROR."""
-    if result is None or "_error" in result:
-        return "ERROR"
-    actions = result.get("policyActions", [])
-    if any(a.get("restrictionAction", "").lower() == "block" for a in actions):
-        return "BLOCKED"
-    return "ALLOWED"
+    result = await _evaluate_content_request(
+        body, scope_activities=FILE_PROBE_ACTIVITIES, headers=headers,
+    )
+    result["_demo"].update({
+        "content_type": content["@odata.type"],
+        "payload_bytes": original_length,
+    })
+    return result
 
 
 async def run_file_support_probe():
     """
-    Answer empirically: does Purview classify Office file binaries, or only text?
+    Compare this tenant's decisions for one payload in three representations.
 
     The same sensitive string is sent three ways and the DLP verdicts compared:
 
@@ -818,10 +935,7 @@ async def run_file_support_probe():
     A is the control: if A does not BLOCK, your DLP policy is not matching the
     test string and the probe cannot conclude anything about file support.
     """
-    global _sequence_number, _correlation_id
-
-    _sequence_number = 0
-    _correlation_id = str(uuid.uuid4())
+    begin_conversation(str(uuid.uuid4()))
 
     console.print()
     console.print(Rule("[bold magenta] FILE SUPPORT PROBE — binary vs text [/]", style="magenta"))
@@ -830,14 +944,14 @@ async def run_file_support_probe():
         Panel(
             "[dim]The Graph schema exposes file content entries "
             "([bold]processFileMetadata[/] + [bold]binaryContent[/] + activity [bold]uploadFile[/]),\n"
-            "but there is no documented list of supported file formats, and Microsoft's own\n"
-            "samples and integrations always send text.\n\n"
+            "and the first-party SDK supports binary data transport.\n"
+            "Transport support alone does not establish parser coverage for a tenant or payload.\n\n"
             "This probe sends the SAME sensitive string three ways and compares the verdicts:[/]\n\n"
             "  [bold]A[/]  textContent            [dim]— plain text (control)[/]\n"
             "  [bold]B[/]  binaryContent (.docx)  [dim]— raw Office bytes, Base64 encoded[/]\n"
             "  [bold]C[/]  textContent (.docx)    [dim]— text extracted client-side from the same .docx[/]\n\n"
-            "[dim]If A and C block but B allows, Purview is NOT parsing the Office binary and\n"
-            "your app must extract text before calling processContent.[/]",
+            "[dim]If A and C block but B allows, that is a text-only signal for this probe,\n"
+            "not proof of general format support. Incomplete evaluations are inconclusive.[/]",
             title="[bold magenta]What is being tested?[/]",
             border_style="magenta",
             padding=(1, 2),
@@ -853,6 +967,15 @@ async def run_file_support_probe():
     with console.status("[bold cyan]Computing protection scopes...", spinner="dots"):
         scopes = await compute_protection_scopes(activities=FILE_PROBE_ACTIVITIES)
     display_protection_scopes(scopes)
+    if scopes is None:
+        console.print("[yellow]INCONCLUSIVE — protection scopes unavailable; probe not sent.[/]")
+        return {label: "EVALUATION_INCOMPLETE" for label in ("A", "B", "C")}
+    if not scopes:
+        console.print(
+            "[yellow]INCONCLUSIVE — NO_POLICY_COVERAGE: scope discovery succeeded "
+            "with no applicable scopes; probe not sent.[/]"
+        )
+        return {label: "NO_POLICY_COVERAGE" for label in ("A", "B", "C")}
 
     docx_bytes = build_docx_bytes(FILE_PROBE_TEXT)
     extracted_text = extract_text_from_docx(docx_bytes)
@@ -898,14 +1021,16 @@ async def run_file_support_probe():
     table.add_column("Content type", style="bold", min_width=24)
     table.add_column("Activity", justify="center")
     table.add_column("Payload", justify="right")
-    table.add_column("Verdict", justify="center", width=10)
+    table.add_column("Verdict", justify="center", min_width=10)
     table.add_column("Latency", justify="right")
 
     verdicts = {}
     for label, content_type, activity, payload, result in variants:
         verdict = verdict_from_result(result)
         verdicts[label] = verdict
-        demo_metadata = (result or {}).get("_demo", {})
+        demo_metadata = result.get("_demo", {}) if isinstance(result, dict) else {}
+        if not isinstance(demo_metadata, dict):
+            demo_metadata = {}
         verdict_style = (
             "bold red" if verdict == "BLOCKED"
             else "bold green" if verdict == "ALLOWED"
@@ -924,17 +1049,23 @@ async def run_file_support_probe():
     console.print(table)
 
     for label, _content_type, _activity, _payload, result in variants:
-        error = (result or {}).get("_error")
-        if error:
-            console.print(
-                f"    [yellow]⚠ {label} failed with HTTP {error['status']}:[/] "
-                f"[dim]{error['message']}[/]"
-            )
-        for processing_error in (result or {}).get("processingErrors", []):
-            console.print(f"    [yellow]⚠ {label} processingError:[/] [dim]{processing_error}[/]")
+        if isinstance(result, dict) and _has_processing_errors(result):
+            console.print(f"    [yellow]{label}: processingErrors reported; details withheld.[/]")
 
     # ── Interpretation ───────────────────────────────────────────────
-    if verdicts.get("A") != "BLOCKED":
+    if any(verdict in ("EVALUATION_INCOMPLETE", "NO_POLICY_COVERAGE") for verdict in verdicts.values()) or any(
+        isinstance(result, dict) and (
+            "_error" in result or "error" in result or _has_processing_errors(result)
+        )
+        for _, _, _, _, result in variants
+    ):
+        conclusion = (
+            "[bold yellow]INCONCLUSIVE[/] — an evaluation was incomplete or lacked policy coverage.\n\n"
+            "An error is not an allow decision or evidence of text-only support.\n"
+            "No file-format conclusion can be drawn; requests remain held."
+        )
+        border = "yellow"
+    elif verdicts.get("A") != "BLOCKED":
         conclusion = (
             "[bold yellow]INCONCLUSIVE[/] — the plain-text control (A) was not blocked.\n\n"
             "Your DLP policy is not matching the test string, so nothing can be concluded\n"
@@ -944,18 +1075,18 @@ async def run_file_support_probe():
         border = "yellow"
     elif verdicts.get("B") == "BLOCKED":
         conclusion = (
-            "[bold green]BINARY PARSING WORKS[/] — the raw .docx (B) was blocked.\n\n"
-            "Purview extracted and classified text from the Office binary in this tenant.\n"
-            "You can send files directly as [bold]binaryContent[/] without client-side extraction."
+            "[bold green]BINARY BLOCK OBSERVED[/] — the raw .docx (B) was blocked.\n\n"
+            "This is an observation for this input and tenant, not proof that all Office\n"
+            "formats are parsed or that client-side extraction is unnecessary."
         )
         border = "green"
-    elif verdicts.get("C") == "BLOCKED":
+    elif verdicts.get("B") == "ALLOWED" and verdicts.get("C") == "BLOCKED":
         conclusion = (
-            "[bold red]TEXT ONLY — CONFIRMED[/] — plain text (A) and extracted text (C) were\n"
+            "[bold red]TEXT-ONLY SIGNAL[/] — plain text (A) and extracted text (C) were\n"
             "blocked, but the identical content sent as a raw .docx binary (B) was not.\n\n"
-            "Purview did not parse the Office binary. Extract text from files client-side and\n"
-            "send it as [bold]textContent[/] inside [bold]processFileMetadata[/] so the file name, size and\n"
-            "owner still appear correctly in Activity Explorer and DSPM for AI."
+            "For this payload and tenant, this suggests a format or scope difference,\n"
+            "not proof of general parser behavior.\n"
+            "Validate file coverage and consider client-side extraction before deployment."
         )
         border = "red"
     else:
@@ -978,8 +1109,8 @@ async def run_file_support_probe():
         )
     )
     console.print(
-        "\n  [dim]Note: all three calls are real audit records and appear in Activity Explorer\n"
-        "  and DSPM for AI, tied together by a single correlationId.[/]\n"
+        "\n  [dim]These are live API attempts sharing a correlationId. API acknowledgement\n"
+        "  does not verify audit arrival in Activity Explorer or DSPM for AI.[/]\n"
     )
 
     return verdicts
@@ -1013,6 +1144,15 @@ async def run_demo(user: dict):
         scopes = await compute_protection_scopes()
 
     display_protection_scopes(scopes)
+    if scopes is None:
+        console.print("[yellow]Demo held: EVALUATION_INCOMPLETE; no model responses generated.[/]")
+        return []
+    if not scopes:
+        console.print(
+            "[yellow]Demo held: NO_POLICY_COVERAGE; scope discovery succeeded "
+            "with no applicable scopes. No model responses generated.[/]"
+        )
+        return []
 
     console.print(
         Panel(
@@ -1024,7 +1164,7 @@ async def run_demo(user: dict):
             "  \u2022 [bold]Protected app / policy location[/] = what app/location the policy applies to\n\n"
             "[dim]The ETag is cached and sent with every processContent call.\n"
             "If Purview detects that policies changed, it tells us to re-compute scopes.\n"
-            "Both uploadText and downloadText calls create audit records in Purview.[/]",
+            "API acknowledgement is not proof of portal arrival; verify audit records separately.[/]",
             title="[bold cyan]What does this mean?[/]",
             border_style="cyan",
             padding=(1, 2),
@@ -1142,7 +1282,7 @@ async def run_demo(user: dict):
             "  [cyan]2.[/] [bold]processContent (uploadText)[/] \u2014 check user prompt, block inline if needed\n"
             "  [cyan]3.[/] [bold]processContent (downloadText)[/] \u2014 audit AI response asynchronously\n"
             "  [cyan]4.[/] [bold]Contextual intelligence[/] \u2014 same data, different context, different decision\n"
-            "  [cyan]5.[/] [bold]Full audit trail[/] \u2014 both prompts and responses visible in Purview\n"
+            "  [cyan]5.[/] [bold]Audit verification[/] \u2014 verify portal arrival separately from API acceptance\n"
             "  [cyan]6.[/] [bold]Central governance[/] \u2014 admins own policy, developers enforce via Graph API\n",
             title="[bold yellow]\U0001f4a1 Key Takeaways[/]",
             border_style="yellow",
@@ -1158,9 +1298,7 @@ async def run_demo(user: dict):
 # ═══════════════════════════════════════════════════════════════════════
 async def interactive_chat():
     """Simulate an AI chat with real-time DLP enforcement."""
-    global _sequence_number, _correlation_id
-    _sequence_number = 0
-    _correlation_id = str(uuid.uuid4())
+    begin_conversation(str(uuid.uuid4()))
 
     console.print()
     console.print(Rule("[bold green] LIVE AI CHAT — with Purview DLP [/]", style="green"))
@@ -1194,35 +1332,35 @@ async def interactive_chat():
             with console.status("[magenta]Purview is evaluating prompt...", spinner="dots"):
                 result = await process_content(user_input.strip())
 
-            if result:
-                actions = result.get("policyActions", [])
-                blocked = any(
-                    a.get("restrictionAction", "").lower() == "block" for a in actions
+            verdict = verdict_from_result(result)
+            if isinstance(result, dict) and _has_processing_errors(result):
+                console.print("[yellow]processingErrors reported; details withheld.[/]")
+            if verdict == "BLOCKED":
+                console.print(
+                    f"  [bold red]\U0001f6d1 {APP_NAME}:[/] "
+                    "[red]BLOCKED by your organization's DLP policies.[/]\n"
                 )
-
-                if blocked:
-                    console.print(
-                        f"  [bold red]\U0001f6d1 {APP_NAME}:[/] "
-                        "[red]I cannot process this request. Sensitive content was detected "
-                        "and blocked by your organization's DLP policies.[/]\n"
-                    )
-                else:
-                    # Simulate AI response
-                    ai_text = random.choice(CHAT_AI_RESPONSES)
-                    console.print(
-                        f"  [bold green]\U0001f916 {APP_NAME}:[/] "
-                        f"[green]{ai_text}[/]"
-                    )
-
-                    # Step 2b: Audit the AI response (downloadText — evaluateOffline)
-                    with console.status("[dim]Auditing response in Purview...", spinner="dots"):
-                        audit_result = await audit_ai_response(ai_text)
-                    render_audit_result(audit_result)
-                    console.print()
+            elif verdict == "ALLOWED":
+                ai_text = random.choice(CHAT_AI_RESPONSES)
+                console.print(
+                    f"  [bold green]\U0001f916 {APP_NAME}:[/] "
+                    f"[green]{ai_text}[/]"
+                )
+                with console.status("[dim]Sending audit request to Purview...", spinner="dots"):
+                    audit_result = await audit_ai_response(ai_text)
+                render_audit_result(audit_result)
+                console.print()
+            elif verdict == "NO_POLICY_COVERAGE":
+                console.print(
+                    f"  [bold yellow]{APP_NAME}:[/] "
+                    "[yellow]NO_POLICY_COVERAGE — scope discovery succeeded with no applicable scopes. "
+                    "Request held; no model response or external action permitted.[/]\n"
+                )
             else:
                 console.print(
                     f"  [bold yellow]\u26a0\ufe0f  {APP_NAME}:[/] "
-                    "[yellow]Could not evaluate content.[/]\n"
+                    "[yellow]EVALUATION_INCOMPLETE — request held. "
+                    "No model response or external action permitted.[/]\n"
                 )
 
         except KeyboardInterrupt:
@@ -1235,7 +1373,45 @@ async def interactive_chat():
 # ═══════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════
+def run_failure_demo() -> list[tuple[str, str]]:
+    """Exercise live decision/rendering logic with local synthetic failures."""
+    console.print(Panel(
+        "[bold yellow]OFFLINE FAILURE DEMO — SYNTHETIC ONLY[/]\n"
+        "No authentication, network requests, model calls, or external actions.\n"
+        "No live Purview events are created; portal arrival is not verified.",
+        border_style="yellow",
+    ))
+    fixtures = (
+        ("HTTP 503 unavailable", _failure_result("http_error", 503)),
+        ("HTTP 429 throttled", _failure_result("http_error", 429)),
+        ("Partial processingErrors", {
+            "policyActions": [],
+            "processingErrors": [{"code": "syntheticProcessingFailure"}],
+        }),
+        ("No policy coverage (valid empty scopes)", {"_coverage": []}),
+        ("Failed protection scope discovery", _failure_result("protection_scopes_unavailable")),
+    )
+    correlation_id = str(uuid.uuid4())
+    results = []
+    for title, result in fixtures:
+        result["_demo"] = {
+            "correlation_id": correlation_id,
+            "request_id": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if "status" in result.get("_error", {}):
+            result["_demo"]["http_status"] = result["_error"]["status"]
+        console.print(Rule(title))
+        verdict = render_result(result, title)
+        results.append((title, verdict))
+        console.print("  Model calls: 0 | External actions: 0 | Synthetic fixture only")
+    return results
+
+
 async def main():
+    if "--failure-demo" in sys.argv[1:]:
+        run_failure_demo()
+        return
     show_banner()
 
     console.print(Rule("[bold] Authentication [/]", style="blue"))
