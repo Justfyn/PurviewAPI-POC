@@ -237,23 +237,30 @@ async def main(args):
         print("Confirm collection configuration in the portal, then pass --collection-confirmed.")
         return 1
 
+    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+    deployment = os.environ.get("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "")
+    try:
+        parsed = urlparse(endpoint)
+        valid_endpoint = (
+            parsed.scheme == "https" and parsed.hostname
+            and parsed.hostname.endswith((".services.ai.azure.com", ".openai.azure.com"))
+            and parsed.port in (None, 443)
+            and parsed.path in ("", "/")
+            and parsed.username is None and parsed.password is None
+            and not parsed.query and not parsed.fragment
+        )
+    except ValueError:
+        valid_endpoint = False
+    if not valid_endpoint or not deployment.strip():
+        print("Set AZURE_OPENAI_ENDPOINT to your Microsoft Foundry resource endpoint "
+              "(https://<resource>.services.ai.azure.com), not a project or API URL, "
+              "and AZURE_OPENAI_CHAT_DEPLOYMENT_NAME to your chat deployment.")
+        return 1
+
     from agent_framework_openai import OpenAIChatCompletionClient
     from azure.identity.aio import DefaultAzureCredential
     from openai import AsyncAzureOpenAI
     from azure.identity.aio import get_bearer_token_provider
-
-    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
-    deployment = os.environ.get("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "")
-    parsed = urlparse(endpoint)
-    if (
-        parsed.scheme != "https" or not parsed.hostname
-        or not parsed.hostname.endswith(".openai.azure.com")
-        or parsed.username or parsed.password or parsed.query or parsed.fragment
-        or not deployment
-    ):
-        print("Set AZURE_OPENAI_ENDPOINT to your Azure OpenAI HTTPS endpoint and "
-              "AZURE_OPENAI_CHAT_DEPLOYMENT_NAME to your deployment.")
-        return 1
 
     async with DefaultAzureCredential() as model_credential:
         token_provider = get_bearer_token_provider(

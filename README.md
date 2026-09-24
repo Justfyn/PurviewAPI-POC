@@ -5,7 +5,7 @@ A proof-of-concept showing how **any custom application or AI app** can integrat
 **Choose your journey:**
 
 - **Understand the API:** `classify_text.py` uses live Graph calls and simulated AI responses.
-- **Protect an agent:** [SDK companion](#sdk-companion-protect-a-payroll-assistant) uses the supported **preview** Purview Agent Framework middleware and a real Azure OpenAI deployment.
+- **Protect an agent:** [SDK companion](#sdk-companion-protect-a-payroll-assistant) uses the supported **preview** Purview Agent Framework middleware and a real Azure OpenAI deployment in **Microsoft Foundry**.
 - **Understand failure behavior:** `python classify_text.py --failure-demo` is an offline, synthetic demonstration; no authentication or cloud calls.
 
 Use synthetic data only. Purview receives content for evaluation even when the application subsequently blocks it from reaching the model. An **ALLOW** result means no blocking action was returned for that evaluation—not that the content is universally safe.
@@ -305,7 +305,7 @@ Each scenario pauses for `[Enter]` so the presenter can explain what's about to 
 “Summarize this employee's payroll record” contains no sensitive number. The
 retrieved **synthetic** record does. The companion puts both messages through
 `PurviewPolicyMiddleware` **before the first model invocation**, so a matching
-inline SSN policy can stop the retrieved information from reaching Azure OpenAI.
+inline SSN policy can stop the retrieved information from reaching the model in Microsoft Foundry.
 Retrieval is a local fixture, not a real HR connector or an authorization system.
 
 The public-record control reaches a real model when policy evaluation succeeds.
@@ -314,7 +314,8 @@ No email, HTTP action, MCP, or other action tools are registered in either case.
 ### Install and configure
 
 Keep the existing raw demo and follow its [prerequisites](#prerequisites) first.
-The companion requires Python 3.10+ and an Azure OpenAI chat deployment:
+The companion requires Python 3.10+ and an Azure OpenAI chat deployment in a
+Microsoft Foundry resource:
 
 ```bash
 pip install -r requirements-sdk.txt
@@ -338,9 +339,18 @@ Set these environment variables in your shell:
 
 | Variable | Value |
 |----------|-------|
-| `AZURE_OPENAI_ENDPOINT` | Your commercial Azure OpenAI endpoint, `https://<resource>.openai.azure.com` |
-| `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` | An existing chat-completions deployment name |
+| `AZURE_OPENAI_ENDPOINT` | Your commercial Microsoft Foundry **resource** endpoint, `https://<resource>.services.ai.azure.com` |
+| `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` | An existing Azure OpenAI chat-completions deployment name in that Foundry resource |
 | `AZURE_OPENAI_API_VERSION` | Optional; defaults to `2024-10-21`, must be supported by your deployment |
+
+Use the resource root, not a Foundry project endpoint ending in
+`/api/projects/<project>`, a `/models` endpoint, or an `/openai/v1` URL.
+The companion retains the `AZURE_OPENAI_*` variable names and OpenAI client
+because it calls the [Azure OpenAI chat-completions API on the Foundry resource](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/ai-gateway#configure-the-base-url-correctly).
+The client adds the deployment path and API version. Existing
+`https://<resource>.openai.azure.com` resource endpoints remain supported.
+This is direct model inference, not a Foundry hosted-agent integration; other
+Foundry model providers are not covered by this sample.
 
 The model connection uses `DefaultAzureCredential` (for example, your local
 Azure CLI sign-in) and requires appropriate Azure OpenAI data-plane access,
@@ -376,7 +386,7 @@ decisions depend on your tenant policies, their scope, and propagation.
    text input, including instructions, via Graph. Only **ALLOWED** continues;
    if content evaluation reports modified policies, revalidate coverage before
    permitting the model call.
-5. **Real model:** non-streaming Azure OpenAI chat completion, without tools.
+5. **Real model:** non-streaming Azure OpenAI chat completion in Microsoft Foundry, without tools.
 6. **SDK post-check:** process the response according to applicable scopes.
    Offline collection is not output blocking or proof of portal arrival.
 

@@ -4,6 +4,7 @@ import base64
 import asyncio
 import io
 import json
+import os
 import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
@@ -13,8 +14,9 @@ import agent_demo
 
 try:
     import httpx
+    from agent_framework import Message
     from agent_framework_openai import OpenAIChatCompletionClient
-    from openai import AsyncOpenAI
+    from openai import AsyncAzureOpenAI, AsyncOpenAI
     import agent_framework_purview
 except ImportError:
     agent_framework_purview = None
@@ -84,6 +86,125 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 await agent_demo.main(SimpleNamespace(preflight=False, collection_confirmed=False)), 1,
             )
+
+    async def test_invalid_model_configuration_stops_before_credentials_or_model(self):
+        root = "https://demo.services.ai.azure.com"
+        invalid_configurations = [
+            ("", "test-model"),
+            ("http://demo.services.ai.azure.com", "test-model"),
+            ("https://model.invalid", "test-model"),
+            ("https://demo.services.ai.azure.com.example.com", "test-model"),
+            (root + "/api/projects/demo", "test-model"),
+            (root + "/models", "test-model"),
+            (root + "/openai/v1", "test-model"),
+            ("https://user@demo.services.ai.azure.com", "test-model"),
+            ("https://@demo.services.ai.azure.com", "test-model"),
+            (root + "?api-version=2024-10-21", "test-model"),
+            (root + "#fragment", "test-model"),
+            (root + ":8443", "test-model"),
+            (root + ":invalid", "test-model"),
+            ("https://[invalid", "test-model"),
+            (root, ""),
+            (root, "   "),
+        ]
+        for endpoint, deployment in invalid_configurations:
+            with self.subTest(endpoint=endpoint, deployment=deployment):
+                output = io.StringIO()
+                with (
+                    patch.dict(os.environ, {
+                        "AZURE_OPENAI_ENDPOINT": endpoint,
+                        "AZURE_OPENAI_CHAT_DEPLOYMENT_NAME": deployment,
+                    }, clear=True),
+                    patch.object(agent_demo, "preflight", AsyncMock(return_value={"id": USER_ID})),
+                    patch("azure.identity.aio.DefaultAzureCredential") as credential_factory,
+                    patch.object(agent_demo, "run_journey", AsyncMock()) as journey,
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(await agent_demo.main(SimpleNamespace(
+                        preflight=False, collection_confirmed=True,
+                    )), 1)
+                credential_factory.assert_not_called()
+                journey.assert_not_awaited()
+                self.assertIn("Microsoft Foundry resource endpoint", output.getvalue())
+
+
+@unittest.skipUnless(agent_framework_purview, "Install requirements-sdk.txt for SDK integration tests")
+class ModelConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_foundry_and_legacy_endpoints_use_authenticated_chat_completions(self):
+        for endpoint, api_version in [
+            ("https://demo.services.ai.azure.com", None),
+            ("https://demo.services.ai.azure.com/", "2024-06-01"),
+            ("https://demo.services.ai.azure.com:443", None),
+            ("https://demo.openai.azure.com", None),
+        ]:
+            with self.subTest(endpoint=endpoint, api_version=api_version):
+                requests = []
+
+                def model_handler(request):
+                    requests.append(request)
+                    return httpx.Response(200, json={
+                        "id": "completion-1", "object": "chat.completion", "created": 0,
+                        "model": "test-model",
+                        "choices": [{
+                            "index": 0, "message": {"role": "assistant", "content": "Synthetic summary."},
+                            "finish_reason": "stop",
+                        }],
+                    })
+
+                async def invoke_model(client, *args):
+                    response = await client.get_response([Message("user", ["Synthetic public context."])])
+                    self.assertEqual(response.text, "Synthetic summary.")
+                    return SimpleNamespace(outcome="MODEL_COMPLETED")
+
+                environment = {
+                    "AZURE_OPENAI_ENDPOINT": endpoint,
+                    "AZURE_OPENAI_CHAT_DEPLOYMENT_NAME": "test-model",
+                }
+                if api_version:
+                    environment["AZURE_OPENAI_API_VERSION"] = api_version
+                credential = AsyncMock()
+                credential.__aenter__.return_value = credential
+                token_provider = AsyncMock(return_value="synthetic-model-token")
+                async with httpx.AsyncClient(transport=httpx.MockTransport(model_handler)) as http_client:
+                    with (
+                        patch.dict(os.environ, environment, clear=True),
+                        patch.object(agent_demo, "preflight", AsyncMock(return_value={"id": USER_ID})),
+                        patch("azure.identity.aio.DefaultAzureCredential", return_value=credential),
+                        patch(
+                            "azure.identity.aio.get_bearer_token_provider", return_value=token_provider,
+                        ) as provider_factory,
+                        patch(
+                            "openai.AsyncAzureOpenAI",
+                            side_effect=lambda **kwargs: AsyncAzureOpenAI(http_client=http_client, **kwargs),
+                        ) as client_factory,
+                        patch.object(agent_demo, "run_journey", side_effect=invoke_model),
+                    ):
+                        self.assertEqual(await agent_demo.main(SimpleNamespace(
+                            preflight=False, collection_confirmed=True,
+                            scenario="payroll", public_record=True,
+                        )), 0)
+
+                provider_factory.assert_called_once_with(
+                    credential, "https://cognitiveservices.azure.com/.default",
+                )
+                client_factory.assert_called_once_with(
+                    azure_endpoint=endpoint, azure_ad_token_provider=token_provider,
+                    api_version=api_version or "2024-10-21", timeout=30, max_retries=0,
+                )
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(
+                    requests[0].url,
+                    httpx.URL(
+                        endpoint.rstrip("/") + "/openai/deployments/test-model/chat/completions",
+                        params={"api-version": api_version or "2024-10-21"},
+                    ),
+                )
+                self.assertEqual(
+                    requests[0].headers["Authorization"], " ".join(("Bearer", token_provider.return_value)),
+                )
+                self.assertEqual(json.loads(requests[0].content)["model"], "test-model")
+                token_provider.assert_awaited_once()
+                credential.__aexit__.assert_awaited_once()
 
 
 @unittest.skipUnless(agent_framework_purview, "Install requirements-sdk.txt for SDK integration tests")
