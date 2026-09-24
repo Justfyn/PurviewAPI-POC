@@ -89,7 +89,8 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
 @unittest.skipUnless(agent_framework_purview, "Install requirements-sdk.txt for SDK integration tests")
 class JourneyTests(unittest.IsolatedAsyncioTestCase):
     async def run_case(self, *, block=False, graph_status=200, coverage=SCOPES,
-                       gate_verdict="ALLOWED", gate_exception=None, sdk_processing_errors=None):
+                       gate_verdict="ALLOWED", gate_exception=None, sdk_processing_errors=None,
+                       modified=False, refreshed_coverage=SCOPES):
         requests = []
         model_calls = []
 
@@ -127,9 +128,14 @@ class JourneyTests(unittest.IsolatedAsyncioTestCase):
             return f"not-a-real-token.{payload}.not-a-signature"
 
         evaluate = AsyncMock(
-            return_value={"policyActions": [], "processingErrors": []},
+            return_value={
+                "policyActions": [], "processingErrors": [],
+                "protectionScopeState": "modified" if modified else "notModified",
+            },
             side_effect=gate_exception,
         )
+        compute = AsyncMock(side_effect=[coverage, refreshed_coverage])
+        real_verdict = agent_demo.graph_demo.verdict_from_result
         output = io.StringIO()
         async with httpx.AsyncClient(transport=httpx.MockTransport(graph_handler)) as http_client:
             model = OpenAIChatCompletionClient(
@@ -146,11 +152,13 @@ class JourneyTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch.object(agent_demo, "PROTECTED_APP_CLIENT_ID", APP_ID),
                 patch.object(agent_demo, "TENANT_ID", TENANT_ID),
-                patch.object(agent_demo.graph_demo, "compute_protection_scopes", AsyncMock(return_value=coverage)),
+                patch.object(agent_demo.graph_demo, "compute_protection_scopes", compute),
                 patch.object(agent_demo.graph_demo, "process_content", evaluate),
                 patch.object(
                     agent_demo.graph_demo, "verdict_from_result",
-                    side_effect=["ALLOWED", gate_verdict] if coverage else [gate_verdict],
+                    side_effect=lambda result: (
+                        gate_verdict if result is evaluate.return_value else real_verdict(result)
+                    ),
                 ),
                 redirect_stdout(output),
             ):
@@ -211,6 +219,29 @@ class JourneyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence.outcome, "EVALUATION_INCOMPLETE")
         self.assertFalse(evidence.model_invoked)
         self.assertEqual(calls, [])
+
+    async def test_policy_change_revalidates_coverage_before_model(self):
+        for scopes, expected in [
+            ([dict(SCOPES[0], activities="downloadText")], "NO_POLICY_COVERAGE"),
+            ([dict(SCOPES[0], executionMode="evaluateOffline")], "NO_POLICY_COVERAGE"),
+            ([dict(SCOPES[0], policyActions=[{
+                "action": "restrictAccess", "restrictionAction": "block",
+            }])], "BLOCKED"),
+            ([], "NO_POLICY_COVERAGE"),
+            (None, "EVALUATION_INCOMPLETE"),
+        ]:
+            with self.subTest(scopes=scopes):
+                evidence, calls, _, _, _ = await self.run_case(
+                    modified=True, refreshed_coverage=scopes,
+                )
+                self.assertEqual(evidence.outcome, expected)
+                self.assertFalse(evidence.model_invoked)
+                self.assertEqual(calls, [])
+
+    async def test_policy_change_with_valid_coverage_can_continue(self):
+        evidence, calls, _, _, _ = await self.run_case(modified=True)
+        self.assertEqual(evidence.outcome, "MODEL_COMPLETED")
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

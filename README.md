@@ -373,7 +373,9 @@ decisions depend on your tenant policies, their scope, and propagation.
 3. **SDK agent middleware:** evaluate prompt and retrieved context; an explicit
    block terminates the run before the chat client is called.
 4. **Application model gate:** recheck coverage and evaluate the complete
-   text input, including instructions, via Graph. Only **ALLOWED** continues.
+   text input, including instructions, via Graph. Only **ALLOWED** continues;
+   if content evaluation reports modified policies, revalidate coverage before
+   permitting the model call.
 5. **Real model:** non-streaming Azure OpenAI chat completion, without tools.
 6. **SDK post-check:** process the response according to applicable scopes.
    Offline collection is not output blocking or proof of portal arrival.
@@ -480,7 +482,7 @@ alongside the existing [validation checklist](#validation-checklist).
 | Expected block allowed | Check scopes/rules and test data; a model call in this case means the expected protection was **not demonstrated**. |
 
 Run `python classify_text.py --failure-demo` to show synthetic 503, 429, partial
-processing and missing-coverage cases without a tenant. These are application
+processing, empty coverage and failed scope-discovery cases without a tenant. These are application
 failure-policy demonstrations, **not live Purview results or audit records**.
 The SDK companion additionally has a 90-second run deadline and disables model
 transport retries. Model and service exception bodies are not printed.
@@ -1027,6 +1029,11 @@ Because they do different jobs:
 ### Why can `compute` return empty while `processContent` still evaluates content?
 
 Treat `compute` as the pre-flight hint and `processContent` as the source of truth for the actual transaction. If your `compute` filter does not line up with how Purview resolves policy location, you can still see `processContent` evaluate the concrete protected app metadata you sent.
+
+For this teaching POC, empty discovery now deliberately **holds the request**
+as `NO_POLICY_COVERAGE`; failed discovery is `EVALUATION_INCOMPLETE`. It does not
+automatically fall through to content evaluation or treat missing coverage as
+an allow. Correct the filter/policy and rerun rather than bypassing the gate.
 
 ### What is the purpose of `policyActions` in `compute` if it is often empty?
 

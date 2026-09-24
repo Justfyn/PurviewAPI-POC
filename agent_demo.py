@@ -138,6 +138,13 @@ def build_model_gate(evidence: ExecutionEvidence):
             if decision != "ALLOWED":
                 evidence.outcome = decision
                 raise EvaluationStopped
+            if result.get("protectionScopeState") == "modified":
+                coverage = scope_coverage(
+                    await graph_demo.compute_protection_scopes(), PROTECTED_APP_CLIENT_ID,
+                )
+                if coverage != "COVERED":
+                    evidence.outcome = coverage
+                    raise EvaluationStopped
             evidence.model_invoked = True
             await call_next()
 
